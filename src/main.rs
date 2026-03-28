@@ -606,6 +606,25 @@ fn find_file_in_dirs(
     None
 }
 
+/// prints rows as a padded table with 2-space column gaps.
+fn print_table(rows: &[Vec<&str>]) {
+    if rows.is_empty() { return; }
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..cols).map(|c| {
+        rows.iter().map(|r| r.get(c).map_or(0, |s| s.len())).max().unwrap_or(0)
+    }).collect();
+    for row in rows {
+        let line: Vec<String> = row.iter().enumerate().map(|(i, val)| {
+            if i + 1 < row.len() {
+                format!("{:<width$}", val, width = widths[i])
+            } else {
+                val.to_string()
+            }
+        }).collect();
+        println!("{}", line.join("  "));
+    }
+}
+
 /// finds all .md files in the given subdirs across all base directories.
 /// returns (name, path) pairs with the `.md` extension stripped.
 fn find_all_in_dirs(subdirs: &[&str]) -> Vec<(String, PathBuf)> {
@@ -613,28 +632,23 @@ fn find_all_in_dirs(subdirs: &[&str]) -> Vec<(String, PathBuf)> {
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    let mut search = |dir: &Path| {
-        for base in &base_dirs {
-            let base_path = dir.join(base);
-            for subdir in subdirs {
-                let search_dir = base_path.join(subdir);
-                if let Ok(entries) = fs::read_dir(&search_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() && path.join("SKILL.md").exists() {
-                            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                                let name = name.to_string();
-                                if seen.insert(name.clone()) {
-                                    results.push((name, path.join("SKILL.md")));
-                                }
-                            }
-                        } else if path.extension().map_or(false, |e| e == "md") {
-                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                                let name = stem.to_string();
-                                if seen.insert(name.clone()) {
-                                    results.push((name, path));
-                                }
-                            }
+    // collects agents/skills from a single directory
+    let mut collect_from = |search_dir: &Path| {
+        if let Ok(entries) = fs::read_dir(search_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join("SKILL.md").exists() {
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        let name = name.to_string();
+                        if seen.insert(name.clone()) {
+                            results.push((name, path.join("SKILL.md")));
+                        }
+                    }
+                } else if path.extension().map_or(false, |e| e == "md") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let name = stem.to_string();
+                        if seen.insert(name.clone()) {
+                            results.push((name, path));
                         }
                     }
                 }
@@ -642,10 +656,19 @@ fn find_all_in_dirs(subdirs: &[&str]) -> Vec<(String, PathBuf)> {
         }
     };
 
+    // searches base_dirs (.opencode, .claude, .agents) under a parent directory
+    let mut search_local = |dir: &Path| {
+        for base in &base_dirs {
+            for subdir in subdirs {
+                collect_from(&dir.join(base).join(subdir));
+            }
+        }
+    };
+
     // walk up from current dir
     let mut current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     loop {
-        search(&current_dir);
+        search_local(&current_dir);
         if current_dir.join(".git").exists() {
             break;
         }
@@ -654,15 +677,17 @@ fn find_all_in_dirs(subdirs: &[&str]) -> Vec<(String, PathBuf)> {
         }
     }
 
-    // global
+    // global: base dirs are the search roots themselves
     if let Ok(home) = env::var("HOME") {
         let home_path = PathBuf::from(home);
-        for dir in [
+        for base_path in [
             home_path.join(".config").join("opencode"),
             home_path.join(".claude"),
             home_path.join(".agents"),
         ] {
-            search(&dir);
+            for subdir in subdirs {
+                collect_from(&base_path.join(subdir));
+            }
         }
     }
 
@@ -997,41 +1022,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.list_agents {
-        for (name, path) in find_all_in_dirs(&["agents"]) {
+        let items: Vec<(String, String)> = find_all_in_dirs(&["agents"]).into_iter().map(|(name, path)| {
             let desc = fs::read_to_string(&path).ok()
                 .and_then(|c| parse_markdown_with_frontmatter::<AgentFrontmatter>(&c).ok())
                 .and_then(|doc| doc.frontmatter.description)
                 .unwrap_or_default();
-            println!("{}\t{}", name, desc);
-        }
+            (name, desc)
+        }).collect();
+        let rows: Vec<Vec<&str>> = items.iter().map(|(n, d)| vec![n.as_str(), d.as_str()]).collect();
+        print_table(&rows);
         process::exit(0);
     }
 
     if args.list_skills {
-        for (name, path) in find_all_in_dirs(&["skills"]) {
+        let items: Vec<(String, String)> = find_all_in_dirs(&["skills"]).into_iter().map(|(name, path)| {
             let desc = fs::read_to_string(&path).ok()
                 .and_then(|c| parse_markdown_with_frontmatter::<SkillFrontmatter>(&c).ok())
                 .and_then(|doc| doc.frontmatter.description)
                 .unwrap_or_default();
-            println!("{}\t{}", name, desc);
-        }
+            (name, desc)
+        }).collect();
+        let rows: Vec<Vec<&str>> = items.iter().map(|(n, d)| vec![n.as_str(), d.as_str()]).collect();
+        print_table(&rows);
         process::exit(0);
     }
 
     if args.list_tools {
-        println!("read\tread the contents of a file");
-        println!("bash\texecute a bash command");
+        print_table(&[
+            vec!["read", "read the contents of a file"],
+            vec!["bash", "execute a bash command"],
+        ]);
         process::exit(0);
     }
 
     let config = load_config()?;
 
     if args.list_providers {
-        for provider in &config.providers {
-            let client = provider.client.as_deref().unwrap_or(&provider.name);
-            let url = provider.base_url.as_deref().unwrap_or("-");
-            println!("{}\t{}\t{}", provider.name, client, url);
-        }
+        let items: Vec<(String, String, String)> = config.providers.iter().map(|p| {
+            let client = p.client.as_deref().unwrap_or(&p.name).to_string();
+            let url = p.base_url.as_deref().unwrap_or("-").to_string();
+            (p.name.clone(), client, url)
+        }).collect();
+        let rows: Vec<Vec<&str>> = items.iter().map(|(n, c, u)| vec![n.as_str(), c.as_str(), u.as_str()]).collect();
+        print_table(&rows);
         process::exit(0);
     }
     

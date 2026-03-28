@@ -234,6 +234,86 @@ test
         .stderr(predicate::str::contains("agent 'test-agent'"));
 }
 
+// --- global directory discovery ---
+
+fn airun_separate_home<'a>(work_dir: &'a TempDir, home_dir: &'a TempDir) -> Command {
+    let mut cmd = Command::cargo_bin("airun").unwrap();
+    cmd.current_dir(work_dir.path());
+    cmd.env("HOME", home_dir.path());
+    cmd
+}
+
+#[test]
+fn test_list_agents_finds_global_agents() {
+    let work_dir = TempDir::new().unwrap();
+    let home_dir = TempDir::new().unwrap();
+    fs::create_dir_all(work_dir.path().join(".git")).unwrap();
+    // place an agent in global ~/.agents/agents/
+    let global_agents = home_dir.path().join(".agents").join("agents");
+    fs::create_dir_all(&global_agents).unwrap();
+    fs::write(global_agents.join("global-agent.md"), "---\ndescription: a global agent\n---\nglobal prompt\n").unwrap();
+
+    airun_separate_home(&work_dir, &home_dir)
+        .arg("--list-agents")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("global-agent"));
+}
+
+#[test]
+fn test_list_skills_finds_global_skills() {
+    let work_dir = TempDir::new().unwrap();
+    let home_dir = TempDir::new().unwrap();
+    fs::create_dir_all(work_dir.path().join(".git")).unwrap();
+    // place a skill in global ~/.claude/skills/
+    let global_skills = home_dir.path().join(".claude").join("skills");
+    fs::create_dir_all(&global_skills).unwrap();
+    fs::write(global_skills.join("global-skill.md"), "---\ndescription: a global skill\n---\nglobal skill body\n").unwrap();
+
+    airun_separate_home(&work_dir, &home_dir)
+        .arg("--list-skills")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("global-skill"));
+}
+
+#[test]
+fn test_list_skills_finds_global_symlinked_dir() {
+    let work_dir = TempDir::new().unwrap();
+    let home_dir = TempDir::new().unwrap();
+    fs::create_dir_all(work_dir.path().join(".git")).unwrap();
+    // create skills in a separate directory and symlink to it
+    let real_skills = home_dir.path().join("real-skills");
+    fs::create_dir_all(&real_skills).unwrap();
+    fs::write(real_skills.join("linked-skill.md"), "---\ndescription: linked skill\n---\nlinked body\n").unwrap();
+    let opencode_dir = home_dir.path().join(".config").join("opencode");
+    fs::create_dir_all(&opencode_dir).unwrap();
+    std::os::unix::fs::symlink(&real_skills, opencode_dir.join("skills")).unwrap();
+
+    airun_separate_home(&work_dir, &home_dir)
+        .arg("--list-skills")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("linked-skill"));
+}
+
+// --- list formatting ---
+
+#[test]
+fn test_list_output_uses_aligned_columns() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let output = airun(&dir)
+        .arg("--list-tools")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // should not contain raw tabs
+    assert!(!stdout.contains('\t'), "output should use spaces, not tabs: {}", stdout);
+    // should have at least 2 spaces between name and description
+    assert!(stdout.contains("  "), "output should have padded columns: {}", stdout);
+}
+
 // --- empty input ---
 
 #[test]

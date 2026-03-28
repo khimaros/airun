@@ -22,3 +22,4 @@
 - [x] --dry-run flag to inspect prompts without calling LLM
 - [x] --skills flag for exclusive skill override
 - [x] show usage on empty prompt (exit non-zero)
+- [x] fix find_all_in_dirs double-nesting base directories for global paths
