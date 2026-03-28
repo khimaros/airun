@@ -1,8 +1,82 @@
 # airun
 
-unix philosophy for the agentic future. `airun` is a simple, one-shot agent and skill runner compatible with `.claude/` and `.opencode/` directory structures. pipe a prompt in, get a streaming response out. agents and skills are plain markdown files with yaml frontmatter — no frameworks, no daemons, no lock-in.
+unix philosophy for the agentic future. pipe a prompt in, get a streaming response out.
+
+`airun` is a simple, one-shot agent runner compatible with `.claude/` and `.opencode/` directory structures. agents and skills are plain markdown files with yaml frontmatter — no frameworks, no daemons, no lock-in.
 
 supports OpenAI, Anthropic, Gemini, Cohere, xAI, and OpenAI-compatible endpoints. written in Rust with minimal dependencies.
+
+## quick start
+
+```bash
+# install
+cargo install --path .
+
+# create a config with your API key
+airun --init
+$EDITOR ~/.config/airun/config.toml
+
+# ask a question (bare model query)
+echo "explain quicksort in one sentence" | airun
+
+# use an agent with an inline prompt
+airun admin "update the debian system"
+
+# pipe input to an agent
+echo "what time is it?" | airun my-agent
+
+# pipe agent output to a shell
+airun admin "list installed packages" | bash
+```
+
+## demo
+
+```
+$ airun admin "check disk usage"
+df -h --output=target,pcent,avail /
+
+$ airun admin "check disk usage" | bash
+Filesystem  Use% Avail
+/           42%  120G
+```
+
+agents have scoped tools and permissions, so `admin` can run `bash` commands while other agents cannot. the response streams to stdout, tool calls log to stderr — composable with standard unix pipes and redirects.
+
+## agents and skills
+
+agents live in `.agents/agents/`, `.claude/agents/`, or `.opencode/agents/` as markdown with yaml frontmatter:
+
+`.agents/agents/admin.md`
+```markdown
+---
+description: "perform system administration tasks"
+tools:
+  read: true
+  bash: true
+permissions:
+  read:
+    "**": deny
+    "/etc/os-release": allow
+  bash:
+    "*": deny
+    "apt update": allow
+    "apt clean": allow
+skills:
+  - system-maintenance
+---
+
+you are an expert systems administrator.
+```
+
+agent frontmatter supports: `description`, `model`, `tools`, `permissions`, `skills`. agent settings override global config.
+
+skills are stored as `<skill_name>/SKILL.md` or `<skill_name>.md` in the `skills/` subdirectory of `.opencode/`, `.claude/`, or `.agents/`. they can also use yaml frontmatter.
+
+### discovery
+
+`airun` walks up from your current working directory to the git worktree root, searching for agents and skills in `.opencode/`, `.claude/`, or `.agents/` directories along the way.
+
+if no local definitions are found, it falls back to global definitions at `~/.config/opencode/`, `~/.claude/`, or `~/.agents/`.
 
 ## configuration
 
@@ -83,81 +157,20 @@ a trailing ` *` or ` **` in a pattern also matches the command with no arguments
 
 when a bash command contains shell metacharacters (pipes, redirects, chaining, etc.), it cannot be safely matched against patterns, so the catch-all (`*`) permission level is used instead.
 
-## agents and skills
-
-agents are stored in `.opencode/agents/`, `.claude/agents/`, or `.agents/agents/` as markdown files with yaml frontmatter:
-
-`.agents/agents/admin.md`
-```markdown
----
-description: "perform system administration tasks"
-tools:
-  read: true
-  bash: true
-permissions:
-  read:
-    "**": deny
-    "/etc/os-release": allow
-  bash:
-    "*": deny
-    "apt update": allow
-    "apt clean": allow
-skills:
-  - system-maintenance
----
-
-you are an expert systems administrator.
-```
-
-agent frontmatter supports: `description`, `model`, `tools`, `permissions`, `skills`. agent settings override global config.
-
-skills are stored as `<skill_name>/SKILL.md` or `<skill_name>.md` in the `skills/` subdirectory of `.opencode/`, `.claude/`, or `.agents/`. they can also use yaml frontmatter.
-
-### discovery
-
-`airun` walks up from your current working directory until it reaches the git worktree root (where `.git` exists), searching for agents and skills in `.opencode/`, `.claude/`, or `.agents/` directories along the way.
-
-if no local definitions are found, it falls back to global definitions at:
-- `~/.config/opencode/`
-- `~/.claude/`
-- `~/.agents/`
-
 ## usage
 
 ```
-airun [OPTIONS] [AGENT_NAME]
+airun [OPTIONS] [AGENT_NAME] [PROMPT]
 ```
 
-pipe a prompt via stdin:
-
-```bash
-echo "what time is it?" | airun my-agent
-```
-
-or use `-p` / `--prompt` for inline queries:
-
-```bash
-airun admin -p "update the debian system" | bash
-```
-
-override the model for a single invocation:
-
-```bash
-echo "hello" | airun -m gemini/gemini-2.0-flash my-agent
-```
-
-run without an agent (bare model query):
-
-```bash
-echo "explain quicksort" | airun -m openai/gpt-4o
-```
+the prompt can be provided as a positional argument after the agent name, via `-p`/`--prompt`, or piped through stdin.
 
 ### options
 
 | flag | description |
 |------|-------------|
 | `--init` | initialize a default configuration file |
-| `-p, --prompt <PROMPT>` | prompt text (alternative to stdin) |
+| `-p, --prompt <PROMPT>` | prompt text (alternative to positional arg or stdin) |
 | `-s, --system-prompt <PROMPT>` | override the system prompt |
 | `-m, --model <MODEL>` | override model (`<provider>/<model>`) |
 | `-t, --max-tokens <N>` | maximum output tokens (default: 16384) |
