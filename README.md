@@ -1,6 +1,8 @@
 # airun
 
-`airun` is a CLI tool written in Rust that executes AI agents and skills defined in Markdown files from `.opencode/`, `.claude/`, or `.agents/` directory structures. it supports multiple LLM providers (OpenAI, Anthropic, Gemini, Cohere, xAI, and OpenAI-compatible endpoints), streaming responses to stdout and reasoning tokens to stderr.
+unix philosophy for the agentic future. `airun` is a simple, one-shot agent and skill runner compatible with `.claude/` and `.opencode/` directory structures. pipe a prompt in, get a streaming response out. agents and skills are plain markdown files with yaml frontmatter — no frameworks, no daemons, no lock-in.
+
+supports OpenAI, Anthropic, Gemini, Cohere, xAI, and OpenAI-compatible endpoints. written in Rust with minimal dependencies.
 
 ## configuration
 
