@@ -423,6 +423,10 @@ struct Args {
     /// the name of the agent to run (optional)
     agent_name: Option<String>,
 
+    /// prompt to send (positional alternative to -p)
+    #[arg(value_name = "PROMPT")]
+    prompt_positional: Option<String>,
+
     /// initialize a default configuration file
     #[arg(long)]
     init: bool,
@@ -698,7 +702,7 @@ fn find_all_in_dirs(subdirs: &[&str]) -> Vec<(String, PathBuf)> {
 fn load_agent(agent_name: &str) -> Result<ParsedDoc<AgentFrontmatter>, Box<dyn std::error::Error>> {
     let filename = format!("{}.md", agent_name);
     let path = find_file_in_dirs(&filename, &["agents"]).ok_or_else(|| {
-        format!("Agent '{}' not found in .opencode/, .claude/, or .agents/ directories", agent_name)
+        format!("agent '{}' not found in .opencode/, .claude/, or .agents/ directories", agent_name)
     })?;
     
     let content = fs::read_to_string(&path)?;
@@ -713,7 +717,7 @@ fn load_skill(skill_name: &str) -> Result<ParsedDoc<SkillFrontmatter>, Box<dyn s
     let path = find_file_in_dirs(&filename_skill_md, &["skills"])
         .or_else(|| find_file_in_dirs(&filename_md, &["skills"]))
         .ok_or_else(|| {
-            format!("Skill '{}' not found in .opencode/, .claude/, or .agents/ directories", skill_name)
+            format!("skill '{}' not found in .opencode/, .claude/, or .agents/ directories", skill_name)
         })?;
     
     let content = fs::read_to_string(&path)?;
@@ -919,17 +923,19 @@ fn build_system_prompt(agent: &ParsedDoc<AgentFrontmatter>) -> String {
 }
 
 fn get_user_prompt(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
-    let mut user_prompt = args.prompt.clone().unwrap_or_default();
+    let mut user_prompt = args.prompt.clone()
+        .or_else(|| args.prompt_positional.clone())
+        .unwrap_or_default();
     if user_prompt.is_empty() {
         if !io::stdin().is_terminal() {
             io::stdin().read_to_string(&mut user_prompt)?;
         }
     }
-    
+
     if user_prompt.trim().is_empty() {
         return Err("one of --prompt or stdin must be non-empty".into());
     }
-    
+
     Ok(user_prompt)
 }
 
