@@ -1,0 +1,39 @@
+# model to use if the agent doesn't specify one
+#default_model = "openai-compatible/qwen3.5-27b:UD-Q4_K_XL"
+
+# max output tokens (including reasoning)
+#default_max_tokens = 16384
+
+# tools: register tools with the LLM (default: false, enable with --tools flag)
+#[tools]
+#read = false
+
+# permissions: control access levels (allow/ask/deny) per tool
+# can be a single level or a map of patterns (most specific match wins)
+#[permissions]
+#read = "allow"
+# or with path patterns:
+#[permissions.read]
+#"*" = "allow"
+#"/etc/shadow" = "deny"
+
+#[[providers]]
+#name = "openai-compatible"
+#client = "openai_completions"
+#api_key = "fake"
+#base_url = "http://localhost:7860/v1"
+
+#[[providers]]
+#name = "openai"
+#client = "openai"
+#api_key = "sk-..."
+
+#[[providers]]
+#name = "anthropic"
+#client = "anthropic"
+#api_key = "sk-ant-..."
+
+#[[providers]]
+#name = "gemini"
+#client = "gemini"
+#api_key = "AIzaSy..."
