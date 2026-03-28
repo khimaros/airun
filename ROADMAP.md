@@ -8,3 +8,17 @@
 - [x] implement cli main loop (stdin, api request, stdout/stderr streams)
 - [x] add unified client type config (openai/openai_responses/anthropic/etc), default to completions
 - [x] add tracing support for verbose logging
+- [x] add bash tool with wildcard permission matching
+- [x] consolidate permission checking across tools
+- [x] add --system-prompt (-s) flag for overriding the system prompt
+- [x] gitignore-style glob patterns for permissions (*, **, ?)
+- [x] implement "ask" permission with /dev/tty user confirmation
+- [x] bash metacharacter fallback to catch-all permission
+- [x] --yes flag for auto-accepting ask prompts
+- [x] --tools takes comma-separated list (exclusive override)
+- [x] --skills flag for exclusive skill override
+- [x] --list-agents, --list-skills, --list-tools, --list-providers (with descriptions)
+- [x] path mode vs command mode for glob matching
+- [x] --dry-run flag to inspect prompts without calling LLM
+- [x] --skills flag for exclusive skill override
+- [x] show usage on empty prompt (exit non-zero)

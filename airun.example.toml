@@ -4,18 +4,26 @@
 # max output tokens (including reasoning)
 #default_max_tokens = 16384
 
+# max tool-use turns before stopping (default: 32)
+#default_max_turns = 32
+
 # tools: register tools with the LLM (default: false, enable with --tools flag)
 #[tools]
 #read = false
+#bash = false
 
 # permissions: control access levels (allow/ask/deny) per tool
 # can be a single level or a map of patterns (most specific match wins)
 #[permissions]
 #read = "allow"
-# or with path patterns:
+#bash = "deny"
+# or with gitignore-style glob patterns (most specific wins):
 #[permissions.read]
-#"*" = "allow"
+#"**" = "allow"
 #"/etc/shadow" = "deny"
+#[permissions.bash]
+#"**" = "deny"
+#"apt update" = "allow"
 
 #[[providers]]
 #name = "openai-compatible"
