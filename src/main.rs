@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 
 /// when true, "ask" permissions are auto-accepted without prompting.
 static AUTO_ACCEPT: AtomicBool = AtomicBool::new(false);
+static QUIET: AtomicBool = AtomicBool::new(false);
 
 // --- permissions model (modeled after opencode.ai/docs/permissions) ---
 
@@ -479,6 +480,10 @@ struct Args {
     #[arg(short = 'y', long)]
     yes: bool,
 
+    /// suppress thinking and tool call output on stderr
+    #[arg(short, long)]
+    quiet: bool,
+
     /// enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -787,49 +792,66 @@ macro_rules! stream_agent {
         let mut stream = $agent.stream_prompt($user_prompt).await;
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
+        let mut in_reasoning = false;
         while let Some(chunk_result) = stream.next().await {
+            macro_rules! end_reasoning {
+                () => {
+                    if in_reasoning {
+                        stderr.write_all(b"\n")?;
+                        stderr.flush()?;
+                        in_reasoning = false;
+                    }
+                };
+            }
             match chunk_result {
                 Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                     rig::streaming::StreamedAssistantContent::Text(t)
                 )) => {
+                    end_reasoning!();
                     stdout.write_all(t.text.as_bytes())?;
                     stdout.flush()?;
                 }
                 Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                     rig::streaming::StreamedAssistantContent::ReasoningDelta { reasoning, .. }
                 )) => {
-                    // dim + italic
-                    stderr.write_all(b"\x1b[2;3m")?;
-                    stderr.write_all(reasoning.as_bytes())?;
-                    stderr.write_all(b"\x1b[0m")?;
-                    stderr.flush()?;
+                    if !QUIET.load(Ordering::Relaxed) {
+                        stderr.write_all(b"\x1b[2;3m")?;
+                        stderr.write_all(reasoning.as_bytes())?;
+                        stderr.write_all(b"\x1b[0m")?;
+                        stderr.flush()?;
+                        in_reasoning = true;
+                    }
                 }
                 Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
                     rig::streaming::StreamedAssistantContent::ToolCall { tool_call, .. }
                 )) => {
-                    // bold cyan tool name + dim args
-                    write!(stderr, "\x1b[1;36m{}\x1b[0m\x1b[2m({})\x1b[0m\n",
-                        tool_call.function.name, tool_call.function.arguments)?;
-                    stderr.flush()?;
+                    end_reasoning!();
+                    if !QUIET.load(Ordering::Relaxed) {
+                        write!(stderr, "\x1b[1;36m{}\x1b[0m\x1b[2m({})\x1b[0m\n",
+                            tool_call.function.name, tool_call.function.arguments)?;
+                        stderr.flush()?;
+                    }
                 }
                 Ok(rig::agent::MultiTurnStreamItem::StreamUserItem(
                     rig::streaming::StreamedUserContent::ToolResult { tool_result, .. }
                 )) => {
-                    // dim tool result, truncated
-                    let result_text: String = tool_result.content.iter()
-                        .filter_map(|c| match c {
-                            rig::message::ToolResultContent::Text(t) => Some(t.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
-                    let truncated = if result_text.len() > 200 {
-                        format!("{}... ({} bytes)", &result_text[..200], result_text.len())
-                    } else {
-                        result_text
-                    };
-                    write!(stderr, "\x1b[2m  -> {}\x1b[0m\n", truncated.replace('\n', "\\n"))?;
-                    stderr.flush()?;
+                    end_reasoning!();
+                    if !QUIET.load(Ordering::Relaxed) {
+                        let result_text: String = tool_result.content.iter()
+                            .filter_map(|c| match c {
+                                rig::message::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        let truncated = if result_text.len() > 200 {
+                            format!("{}... ({} bytes)", &result_text[..200], result_text.len())
+                        } else {
+                            result_text
+                        };
+                        write!(stderr, "\x1b[2m  -> {}\x1b[0m\n", truncated.replace('\n', "\\n"))?;
+                        stderr.flush()?;
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -837,6 +859,10 @@ macro_rules! stream_agent {
                     break;
                 }
             }
+        }
+        if in_reasoning {
+            stderr.write_all(b"\n")?;
+            stderr.flush()?;
         }
     }};
 }
@@ -1017,6 +1043,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.yes {
         AUTO_ACCEPT.store(true, Ordering::Relaxed);
+    }
+    if args.quiet {
+        QUIET.store(true, Ordering::Relaxed);
     }
 
     if args.init {

@@ -177,6 +177,7 @@ the prompt can be provided as a positional argument after the agent name, via `-
 | `--tools <LIST>` | enable specific tools exclusively (comma-separated, e.g. `read,bash`) |
 | `--skills <LIST>` | use specific skills exclusively (comma-separated, overrides agent) |
 | `-n, --dry-run` | print what would be sent to the LLM and exit |
+| `-q, --quiet` | suppress thinking and tool call output on stderr |
 | `-y, --yes` | auto-accept "ask" permission prompts |
 | `-v, --verbose` | enable verbose/debug logging |
 | `--list-agents` | list discovered agents |
