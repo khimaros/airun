@@ -6,7 +6,7 @@
 - [x] implement markdown agent/skill parsing from `.claude/` and `.opencode/`
 - [x] implement openai api streaming client
 - [x] implement cli main loop (stdin, api request, stdout/stderr streams)
-- [x] add unified client type config (openai/openai_responses/anthropic/etc), default to completions
+- [x] add unified client type config (openai/openai_responses/anthropic/etc)
 - [x] add tracing support for verbose logging
 - [x] add bash tool with wildcard permission matching
 - [x] consolidate permission checking across tools
@@ -23,3 +23,19 @@
 - [x] --skills flag for exclusive skill override
 - [x] show usage on empty prompt (exit non-zero)
 - [x] fix find_all_in_dirs double-nesting base directories for global paths
+- [x] hook protocol v1 (partial conformance, see DESIGN.md):
+  - [x] discover hooks from `hooks/` under existing base dirs (.claude/.opencode/.agents, plus globals)
+  - [x] `discover` stage at startup: register hook tools (`<prefix>_<tool_name>`)
+  - [x] `mutate_request` stage: merge returned `system` strings into the system prompt
+  - [x] `execute_tool` stage: route invocations of hook-registered tools back to the owning script
+  - [x] `tool_before` / `tool_after` observational stages around built-in `read` and `bash`
+  - [x] honor `permission.arg` for hook tools (route through existing `check_tool_permission`)
+  - [x] `--list-hooks` flag
+  - [x] hook tools appear in `--list-tools`
+  - [x] typed parameters: validate args (required, type, enum) before `execute_tool`; normalize `any` type
+  - [x] dry-run inclusion of hooks (own section + tools/permissions list)
+- [x] `--dump-request` (`-D`) flag emits exact OpenAI chat-completions JSON request body
+- [x] `make precommit` target (lint + test + build)
+- [x] configurable tool-call output truncation (stderr display); full content spooled to `$XDG_CACHE_HOME/airun/<pid>/<seq>.txt` with a clear warning
+- [x] `read` tool: optional `offset` (0-indexed line) and `count` (number of lines) parameters
+- [x] config `default_system_prompt` used when no `-s` and no agent body

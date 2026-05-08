@@ -14,3 +14,6 @@ lint:
 format:
 	cargo fmt
 .PHONY: format
+
+precommit: lint test build
+.PHONY: precommit

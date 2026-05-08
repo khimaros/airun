@@ -18,6 +18,65 @@ fn airun(dir: &TempDir) -> Command {
     cmd
 }
 
+// --- hooks ---
+
+#[cfg(unix)]
+fn write_hook(dir: &TempDir, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let hooks_dir = dir.path().join(".agents").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let path = hooks_dir.join(name);
+    fs::write(&path, body).unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_list_hooks_discovers_scripts() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    write_hook(&dir, "demo.sh", "#!/bin/sh\nstage=\"$1\"\nif [ \"$stage\" = \"discover\" ]; then\n  echo '{\"name\":\"demo\",\"tools\":[{\"name\":\"ping\",\"description\":\"ping the demo\",\"parameters\":{\"msg\":\"the message\"}}]}'\nfi\n");
+    airun(&dir)
+        .arg("--list-hooks")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("demo"))
+        .stdout(predicate::str::contains("demo_ping"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_mutate_request_appends_to_system_prompt() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    write_hook(&dir, "mutate.sh", "#!/bin/sh\nif [ \"$1\" = \"mutate_request\" ]; then\n  echo '{\"system\":[\"INJECTED-BY-HOOK\"]}'\nfi\n");
+    airun(&dir)
+        .arg("-s").arg("base prompt")
+        .arg("-p").arg("hi")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("base prompt"))
+        .stdout(predicate::str::contains("INJECTED-BY-HOOK"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_non_executable_hook_skipped() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let hooks_dir = dir.path().join(".agents").join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    fs::write(hooks_dir.join("not_exec.sh"), "#!/bin/sh\necho '{\"name\":\"nope\"}'\n").unwrap();
+    airun(&dir)
+        .arg("--list-hooks")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nope").not());
+}
+
 // --- permission pattern matching ---
 
 #[test]
@@ -36,16 +95,15 @@ test agent
 "#);
     // we can't easily test tool invocation without a real LLM,
     // but we can verify the agent loads and the CLI parses correctly
-    let result = airun(&dir)
+    airun(&dir)
         .arg("test-agent")
         .arg("-p")
         .arg("test")
         .arg("-v")
+        .arg("--dry-run")
         .write_stdin("")
-        .assert();
-    // should fail due to missing API key, but after parsing agent config
-    result.failure()
-        .stderr(predicate::str::contains("no API key found"));
+        .assert()
+        .success();
 }
 
 #[test]
@@ -64,15 +122,15 @@ permissions:
 ---
 test agent
 "#);
-    let result = airun(&dir)
+    airun(&dir)
         .arg("test-agent")
         .arg("-p")
         .arg("test")
         .arg("-v")
+        .arg("--dry-run")
         .write_stdin("")
-        .assert();
-    result.failure()
-        .stderr(predicate::str::contains("no API key found"));
+        .assert()
+        .success();
 }
 
 // --- CLI flag parsing ---
@@ -112,25 +170,26 @@ fn test_yes_flag_accepted() {
         .arg("-y")
         .arg("-p")
         .arg("test")
+        .arg("--dry-run")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("no API key found"));
+        .success();
 }
 
 #[test]
 fn test_system_prompt_flag() {
     let dir = TempDir::new().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
-    let result = airun(&dir)
+    airun(&dir)
         .arg("-s")
         .arg("you are a pirate")
         .arg("-p")
         .arg("hello")
         .arg("-v")
+        .arg("--dry-run")
         .write_stdin("")
-        .assert();
-    result.failure()
-        .stderr(predicate::str::contains("no API key found"));
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("you are a pirate"));
 }
 
 #[test]
@@ -141,17 +200,19 @@ description: original agent
 ---
 original system prompt
 "#);
-    let result = airun(&dir)
+    airun(&dir)
         .arg("test-agent")
         .arg("-s")
         .arg("override prompt")
         .arg("-p")
         .arg("hello")
         .arg("-v")
+        .arg("--dry-run")
         .write_stdin("")
-        .assert();
-    result.failure()
-        .stderr(predicate::str::contains("no API key found"));
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("override prompt"))
+        .stdout(predicate::str::contains("original system prompt").not());
 }
 
 // --- init ---

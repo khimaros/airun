@@ -5,6 +5,7 @@ tools:
 permissions:
   read:
     "*": deny
+    "Makefile": allow
     "README.md": allow
     "DESIGN.md": allow
     "ROADMAP.md": allow
@@ -12,6 +13,8 @@ permissions:
     "*": deny
     "make *":  allow
 ---
+
+execute the required task when requested
 
 ## build
 

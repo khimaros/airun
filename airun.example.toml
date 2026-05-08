@@ -7,6 +7,14 @@
 # max tool-use turns before stopping (default: 32)
 #default_max_turns = 32
 
+# fallback system prompt when no -s flag is given and no agent body sets one
+#default_system_prompt = "you are a helpful assistant."
+
+# max bytes of tool-call output rendered to stderr; full content is spooled to
+# $XDG_CACHE_HOME/airun/<pid>/<seq>.txt with a hint pointing at the file.
+# set to 0 to disable truncation entirely (default: 2000)
+#tool_output_truncate = 2000
+
 # tools: register tools with the LLM (default: false, enable with --tools flag)
 #[tools]
 #read = false

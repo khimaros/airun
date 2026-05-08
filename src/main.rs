@@ -1,3 +1,5 @@
+mod hooks;
+
 use clap::{CommandFactory, Parser};
 use rig::client::CompletionClient;
 use rig::completion::ToolDefinition;
@@ -11,13 +13,44 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use futures_util::stream::StreamExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use hooks::HookManager;
 use tracing_subscriber::EnvFilter;
 
 /// when true, "ask" permissions are auto-accepted without prompting.
 static AUTO_ACCEPT: AtomicBool = AtomicBool::new(false);
 static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// max bytes of tool-call output rendered to stderr; full content is spooled
+/// to a per-process file under the cache dir when this limit is exceeded.
+const DEFAULT_TOOL_OUTPUT_TRUNCATE: usize = 2000;
+static TOOL_OUTPUT_TRUNCATE: AtomicUsize = AtomicUsize::new(DEFAULT_TOOL_OUTPUT_TRUNCATE);
+
+/// monotonic counter for naming spooled tool-output files this process.
+static SPOOL_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// returns the cache dir for spooled output: $XDG_CACHE_HOME/airun/<pid>/
+/// (falls back to $HOME/.cache, then /tmp).
+fn spool_dir() -> PathBuf {
+    let base = env::var("XDG_CACHE_HOME").map(PathBuf::from)
+        .or_else(|_| env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    base.join("airun").join(process::id().to_string())
+}
+
+/// writes `content` to a fresh file under the spool dir, returns its path
+/// (or None on failure — caller should degrade silently).
+fn write_spool_file(content: &str) -> Option<PathBuf> {
+    let dir = spool_dir();
+    fs::create_dir_all(&dir).ok()?;
+    let n = SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{}.txt", n));
+    fs::write(&path, content).ok()?;
+    Some(path)
+}
 
 // --- permissions model (modeled after opencode.ai/docs/permissions) ---
 
@@ -195,11 +228,66 @@ impl PermissionsConfig {
         PermissionsConfig { tools: merged }
     }
 
+    /// applies CLI-style overrides on top of self with pattern-level
+    /// granularity. for each override:
+    ///   - a bare `TOOL=LEVEL` replaces the tool entry entirely.
+    ///   - a `TOOL:PATTERN=LEVEL` merges into the tool's pattern map; if the
+    ///     existing entry was a single level, it is first promoted to a
+    ///     pattern map with `**` mapped to the old level.
+    fn apply_overrides(mut self, overrides: &[PermissionOverride]) -> Self {
+        for ov in overrides {
+            match &ov.pattern {
+                None => {
+                    self.tools.insert(ov.tool.clone(), Permission::Level(ov.level.clone()));
+                }
+                Some(pat) => {
+                    let existing = self.tools.remove(&ov.tool);
+                    let mut patterns = match existing {
+                        Some(Permission::Patterns(map)) => map,
+                        Some(Permission::Level(lvl)) => {
+                            let mut m = HashMap::new();
+                            m.insert("**".to_string(), lvl);
+                            m
+                        }
+                        None => HashMap::new(),
+                    };
+                    patterns.insert(pat.clone(), ov.level.clone());
+                    self.tools.insert(ov.tool.clone(), Permission::Patterns(patterns));
+                }
+            }
+        }
+        self
+    }
+
     fn check(&self, tool_name: &str, input: &str, path_mode: bool) -> PermissionLevel {
         self.tools.get(tool_name)
             .map(|p| p.check(input, path_mode))
             .unwrap_or(PermissionLevel::Deny)
     }
+}
+
+/// a single CLI permission override, built from `--permissions-{allow,ask,deny}`.
+/// shapes for the flag value:
+///   `TOOL`                   → pattern is None (replaces tool entry)
+///   `TOOL:PATTERN`           → pattern merges into the tool's map
+#[derive(Debug, Clone)]
+struct PermissionOverride {
+    tool: String,
+    pattern: Option<String>,
+    level: PermissionLevel,
+}
+
+/// parses the `TOOL` or `TOOL:PATTERN` value (without the level — that's
+/// supplied by which flag was used).
+fn parse_permission_target(s: &str) -> Result<(String, Option<String>), String> {
+    let (tool, pattern) = match s.split_once(':') {
+        Some((t, p)) => (t.trim().to_string(), Some(p.to_string())),
+        None => (s.trim().to_string(), None),
+    };
+    if tool.is_empty() {
+        return Err(format!("invalid permission target '{}': empty tool name", s));
+    }
+    Ok((tool, pattern))
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -230,6 +318,30 @@ impl ToolsConfig {
 #[derive(Deserialize)]
 struct ReadArgs {
     path: String,
+    /// 0-indexed line number to start reading from (default: 0)
+    #[serde(default)]
+    offset: Option<usize>,
+    /// number of lines to read (default: read to end)
+    #[serde(default)]
+    count: Option<usize>,
+}
+
+/// returns a slice of `content` covering `count` lines starting at the
+/// 0-indexed `offset`. if both are None, returns the input unchanged.
+fn slice_lines(content: &str, offset: Option<usize>, count: Option<usize>) -> String {
+    if offset.is_none() && count.is_none() {
+        return content.to_string();
+    }
+    let start = offset.unwrap_or(0);
+    let lines: Vec<&str> = content.lines().collect();
+    let end = match count {
+        Some(n) => (start + n).min(lines.len()),
+        None => lines.len(),
+    };
+    if start >= lines.len() {
+        return String::new();
+    }
+    lines[start..end].join("\n")
 }
 
 /// prompts the user for confirmation via /dev/tty (bypassing stdin which
@@ -286,6 +398,34 @@ fn check_tool_permission(
 
 struct ReadTool {
     permissions: PermissionsConfig,
+    hooks: Arc<HookManager>,
+}
+
+fn read_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "read".to_string(),
+        description: "read the contents of a file".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "absolute or relative path to the file to read"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "0-indexed line number to start reading from (default: 0)",
+                    "minimum": 0
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "number of lines to read (default: read to end)",
+                    "minimum": 1
+                }
+            },
+            "required": ["path"]
+        }),
+    }
 }
 
 impl Tool for ReadTool {
@@ -295,29 +435,27 @@ impl Tool for ReadTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "read".to_string(),
-            description: "read the contents of a file at the given path".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "absolute or relative path to the file to read"
-                    }
-                },
-                "required": ["path"]
-            }),
-        }
+        read_tool_definition()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let resolved = resolve_path(&args.path);
-        let path_str = resolved.to_string_lossy();
+        let path_str = resolved.to_string_lossy().into_owned();
         check_tool_permission(&self.permissions, "read", &path_str, true)?;
-        fs::read_to_string(&resolved).map_err(|e| {
-            ToolError::ToolCallError(format!("{}: {}", path_str, e).into())
-        })
+
+        let call_id = next_call_id();
+        let args_json = serde_json::json!({"path": args.path});
+        self.hooks.tool_before("read", &call_id, &args_json);
+
+        let content = fs::read_to_string(&resolved)
+            .map(|c| slice_lines(&c, args.offset, args.count))
+            .map_err(|e| {
+                ToolError::ToolCallError(format!("{}: {}", path_str, e).into())
+            })?;
+        let result = serde_json::to_string(&serde_json::json!({"content": content}))
+            .expect("serialize read result");
+        self.hooks.tool_after("read", &call_id, &result);
+        Ok(result)
     }
 }
 
@@ -339,6 +477,44 @@ struct BashArgs {
 
 struct BashTool {
     permissions: PermissionsConfig,
+    hooks: Arc<HookManager>,
+}
+
+/// renders a `ToolDefinition` as an OpenAI chat-completions tool entry.
+fn tool_def_as_function(def: &ToolDefinition) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": def.name,
+            "description": def.description,
+            "parameters": def.parameters,
+        }
+    })
+}
+
+fn bash_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "bash".to_string(),
+        description: "execute a bash command and return its output".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "the bash command to execute. must be simple — no pipes, redirects, chaining, or shell metacharacters"
+                }
+            },
+            "required": ["command"]
+        }),
+    }
+}
+
+/// monotonic counter for `tool_before`/`tool_after` correlation ids.
+static CALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_call_id() -> String {
+    let n = CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("airun-{}-{}", std::process::id(), n)
 }
 
 impl Tool for BashTool {
@@ -348,20 +524,7 @@ impl Tool for BashTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "bash".to_string(),
-            description: "execute a bash command and return its output. commands must be simple (no pipes, redirects, chaining, or shell metacharacters).".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "the bash command to execute (no pipes, redirects, semicolons, or shell metacharacters)"
-                    }
-                },
-                "required": ["command"]
-            }),
-        }
+        bash_tool_definition()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -388,6 +551,10 @@ impl Tool for BashTool {
                 }
             }
         }
+        let call_id = next_call_id();
+        let args_json = serde_json::json!({"command": args.command});
+        self.hooks.tool_before("bash", &call_id, &args_json);
+
         let output = process::Command::new("sh")
             .arg("-c")
             .arg(&args.command)
@@ -397,12 +564,16 @@ impl Tool for BashTool {
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() {
-            Ok(stdout.into_owned())
-        } else {
-            let code = output.status.code().unwrap_or(-1);
-            Ok(format!("exit code {}\nstdout:\n{}\nstderr:\n{}", code, stdout, stderr))
+        let mut obj = serde_json::Map::new();
+        obj.insert("exit_code".into(), serde_json::json!(output.status.code().unwrap_or(-1)));
+        obj.insert("stdout".into(), serde_json::json!(stdout));
+        if !stderr.is_empty() {
+            obj.insert("stderr".into(), serde_json::json!(stderr));
         }
+        let result = serde_json::to_string(&serde_json::Value::Object(obj))
+            .expect("serialize bash result");
+        self.hooks.tool_after("bash", &call_id, &result);
+        Ok(result)
     }
 }
 
@@ -448,6 +619,26 @@ struct Args {
     #[arg(long)]
     list_providers: bool,
 
+    /// list discovered hook scripts and their registered tools
+    #[arg(long)]
+    list_hooks: bool,
+
+    /// list resolved permissions (after merging config + agent + --permissions)
+    #[arg(long)]
+    list_permissions: bool,
+
+    /// allow a tool or tool:pattern (repeatable, e.g. --permissions-allow 'bash:apt update')
+    #[arg(long = "permissions-allow", value_name = "TOOL[:PATTERN]", value_parser = parse_permission_target)]
+    permissions_allow: Vec<(String, Option<String>)>,
+
+    /// require an "ask" prompt for a tool or tool:pattern (repeatable)
+    #[arg(long = "permissions-ask", value_name = "TOOL[:PATTERN]", value_parser = parse_permission_target)]
+    permissions_ask: Vec<(String, Option<String>)>,
+
+    /// deny a tool or tool:pattern (repeatable)
+    #[arg(long = "permissions-deny", value_name = "TOOL[:PATTERN]", value_parser = parse_permission_target)]
+    permissions_deny: Vec<(String, Option<String>)>,
+
     /// prompt to send to the agent (if not provided via stdin)
     #[arg(short, long)]
     prompt: Option<String>,
@@ -472,9 +663,15 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     skills: Option<Vec<String>>,
 
-    /// print what would be sent to the LLM and exit
+    /// print a human-readable summary of what would be sent and exit
     #[arg(short = 'n', long)]
     dry_run: bool,
+
+    /// dump the exact JSON request body (OpenAI chat-completions shape)
+    /// that would be sent to the LLM, then exit. tool definitions and
+    /// system/user messages are included verbatim.
+    #[arg(short = 'D', long)]
+    dump_request: bool,
 
     /// auto-accept "ask" permission prompts
     #[arg(short = 'y', long)]
@@ -503,6 +700,10 @@ struct Config {
     default_model: Option<String>,
     default_max_tokens: Option<u64>,
     default_max_turns: Option<usize>,
+    /// fallback system prompt used when no `-s` flag and no agent body
+    default_system_prompt: Option<String>,
+    /// max bytes of tool-call output rendered to stderr (default: 2000)
+    tool_output_truncate: Option<usize>,
     #[serde(default)]
     tools: ToolsConfig,
     #[serde(default, alias = "permission")]
@@ -558,60 +759,88 @@ fn parse_markdown_with_frontmatter<T: serde::de::DeserializeOwned + Default>(
     })
 }
 
-fn find_file_in_dirs(
-    filename: &str,
-    subdirs: &[&str],
-) -> Option<PathBuf> {
-    let base_dirs = [".opencode", ".claude", ".agents"];
-    
-    // walk up from current dir
-    let mut current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    
-    loop {
-        for base in &base_dirs {
-            let base_path = current_dir.join(base);
-            for subdir in subdirs {
-                let path = base_path.join(subdir).join(filename);
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-            let path = base_path.join(filename);
-            if path.exists() {
-                return Some(path);
-            }
-        }
-        if current_dir.join(".git").exists() {
-            break;
-        }
-        if !current_dir.pop() {
-            break;
-        }
+/// distinguishes agent vs. skill lookup so the search can pick the right
+/// per-base subdirectories (e.g. `.pi/agent/prompts` for agents but
+/// `.pi/agent/skills` for skills).
+#[derive(Copy, Clone)]
+enum Kind { Agent, Skill }
+
+/// flat fallback bases tried at each cwd-walk level after kind-specific
+/// subdirs. these allow loose layouts like `.agents/foo.md` to work for
+/// `load_*` but they are NOT enumerated for `--list-*`.
+const FLAT_LOCAL_BASES: &[&str] = &[".opencode", ".claude", ".agents"];
+
+/// kind-specific subdir suffixes searched relative to the cwd-walk parent.
+fn local_subdirs(kind: Kind) -> &'static [&'static str] {
+    match kind {
+        Kind::Agent => &[
+            ".opencode/agents",
+            ".claude/agents",
+            ".agents/agents",
+        ],
+        Kind::Skill => &[
+            ".opencode/skills",
+            ".claude/skills",
+            ".agents/skills",
+            ".pi/agent/skills",
+        ],
     }
-    
-    // check global configurations
-    if let Ok(home) = env::var("HOME") {
-        let home_path = PathBuf::from(home);
-        let global_bases = [
-            home_path.join(".config").join("opencode"),
-            home_path.join(".claude"),
-            home_path.join(".agents"),
-        ];
-        
-        for base_path in global_bases {
-            for subdir in subdirs {
-                let path = base_path.join(subdir).join(filename);
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-            let path = base_path.join(filename);
-            if path.exists() {
-                return Some(path);
-            }
+}
+
+/// kind-specific global search dirs (already absolute, $HOME-anchored).
+fn global_subdirs(kind: Kind) -> Vec<PathBuf> {
+    let Ok(home) = env::var("HOME") else { return Vec::new(); };
+    let h = PathBuf::from(home);
+    match kind {
+        Kind::Agent => vec![
+            h.join(".config/opencode/agents"),
+            h.join(".claude/agents"),
+            h.join(".agents/agents"),
+        ],
+        Kind::Skill => vec![
+            h.join(".config/opencode/skills"),
+            h.join(".claude/skills"),
+            h.join(".agents/skills"),
+            h.join(".pi/agent/skills"),
+        ],
+    }
+}
+
+/// flat global bases tried after kind-specific globals (lookup only).
+fn flat_global_bases() -> Vec<PathBuf> {
+    let Ok(home) = env::var("HOME") else { return Vec::new(); };
+    let h = PathBuf::from(home);
+    vec![
+        h.join(".config/opencode"),
+        h.join(".claude"),
+        h.join(".agents"),
+    ]
+}
+
+fn find_file_in_dirs(kind: Kind, filename: &str) -> Option<PathBuf> {
+    // walk up from current dir, retrying kind-specific + flat fallbacks
+    let mut current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    loop {
+        for sub in local_subdirs(kind) {
+            let path = current_dir.join(sub).join(filename);
+            if path.exists() { return Some(path); }
         }
+        for base in FLAT_LOCAL_BASES {
+            let path = current_dir.join(base).join(filename);
+            if path.exists() { return Some(path); }
+        }
+        if current_dir.join(".git").exists() { break; }
+        if !current_dir.pop() { break; }
     }
 
+    for d in global_subdirs(kind) {
+        let path = d.join(filename);
+        if path.exists() { return Some(path); }
+    }
+    for d in flat_global_bases() {
+        let path = d.join(filename);
+        if path.exists() { return Some(path); }
+    }
     None
 }
 
@@ -634,14 +863,56 @@ fn print_table(rows: &[Vec<&str>]) {
     }
 }
 
-/// finds all .md files in the given subdirs across all base directories.
-/// returns (name, path) pairs with the `.md` extension stripped.
-fn find_all_in_dirs(subdirs: &[&str]) -> Vec<(String, PathBuf)> {
-    let base_dirs = [".opencode", ".claude", ".agents"];
+fn permission_level_str(l: &PermissionLevel) -> &'static str {
+    match l {
+        PermissionLevel::Allow => "allow",
+        PermissionLevel::Ask => "ask",
+        PermissionLevel::Deny => "deny",
+    }
+}
+
+/// counts wildcards in a glob pattern; used to sort patterns by specificity
+/// for display (most specific first), matching the runtime tie-breaking.
+fn pattern_wildcards(p: &str) -> usize {
+    p.matches('*').count() + p.matches('?').count()
+}
+
+fn print_permissions(perms: &PermissionsConfig) {
+    let mut tools: Vec<&String> = perms.tools.keys().collect();
+    tools.sort();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for tool in tools {
+        match &perms.tools[tool] {
+            Permission::Level(lvl) => {
+                rows.push(vec![tool.clone(), String::new(), permission_level_str(lvl).to_string()]);
+            }
+            Permission::Patterns(map) => {
+                let mut entries: Vec<(&String, &PermissionLevel)> = map.iter().collect();
+                // most specific first (fewest wildcards, then longer pattern,
+                // then alphabetical for stable output)
+                entries.sort_by(|a, b| {
+                    pattern_wildcards(a.0).cmp(&pattern_wildcards(b.0))
+                        .then(b.0.len().cmp(&a.0.len()))
+                        .then(a.0.cmp(b.0))
+                });
+                for (i, (pat, lvl)) in entries.iter().enumerate() {
+                    let name = if i == 0 { tool.clone() } else { String::new() };
+                    rows.push(vec![name, (*pat).clone(), permission_level_str(lvl).to_string()]);
+                }
+            }
+        }
+    }
+    let row_refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
+    print_table(&row_refs);
+}
+
+/// finds all .md files in kind-specific subdirs across all base directories.
+/// returns (name, path) pairs with the `.md` extension stripped. flat
+/// fallback bases are not enumerated here — only structured subdirs.
+fn find_all_in_dirs(kind: Kind) -> Vec<(String, PathBuf)> {
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    // collects agents/skills from a single directory
     let mut collect_from = |search_dir: &Path| {
         if let Ok(entries) = fs::read_dir(search_dir) {
             for entry in entries.flatten() {
@@ -653,7 +924,7 @@ fn find_all_in_dirs(subdirs: &[&str]) -> Vec<(String, PathBuf)> {
                             results.push((name, path.join("SKILL.md")));
                         }
                     }
-                } else if path.extension().map_or(false, |e| e == "md") {
+                } else if path.extension().is_some_and(|e| e == "md") {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                         let name = stem.to_string();
                         if seen.insert(name.clone()) {
@@ -665,39 +936,17 @@ fn find_all_in_dirs(subdirs: &[&str]) -> Vec<(String, PathBuf)> {
         }
     };
 
-    // searches base_dirs (.opencode, .claude, .agents) under a parent directory
-    let mut search_local = |dir: &Path| {
-        for base in &base_dirs {
-            for subdir in subdirs {
-                collect_from(&dir.join(base).join(subdir));
-            }
-        }
-    };
-
-    // walk up from current dir
     let mut current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     loop {
-        search_local(&current_dir);
-        if current_dir.join(".git").exists() {
-            break;
+        for sub in local_subdirs(kind) {
+            collect_from(&current_dir.join(sub));
         }
-        if !current_dir.pop() {
-            break;
-        }
+        if current_dir.join(".git").exists() { break; }
+        if !current_dir.pop() { break; }
     }
 
-    // global: base dirs are the search roots themselves
-    if let Ok(home) = env::var("HOME") {
-        let home_path = PathBuf::from(home);
-        for base_path in [
-            home_path.join(".config").join("opencode"),
-            home_path.join(".claude"),
-            home_path.join(".agents"),
-        ] {
-            for subdir in subdirs {
-                collect_from(&base_path.join(subdir));
-            }
-        }
+    for d in global_subdirs(kind) {
+        collect_from(&d);
     }
 
     results.sort_by(|a, b| a.0.cmp(&b.0));
@@ -706,7 +955,7 @@ fn find_all_in_dirs(subdirs: &[&str]) -> Vec<(String, PathBuf)> {
 
 fn load_agent(agent_name: &str) -> Result<ParsedDoc<AgentFrontmatter>, Box<dyn std::error::Error>> {
     let filename = format!("{}.md", agent_name);
-    let path = find_file_in_dirs(&filename, &["agents"]).ok_or_else(|| {
+    let path = find_file_in_dirs(Kind::Agent, &filename).ok_or_else(|| {
         format!("agent '{}' not found in .opencode/, .claude/, or .agents/ directories", agent_name)
     })?;
     
@@ -719,10 +968,10 @@ fn load_skill(skill_name: &str) -> Result<ParsedDoc<SkillFrontmatter>, Box<dyn s
     let filename_md = format!("{}.md", skill_name);
     let filename_skill_md = format!("{}/SKILL.md", skill_name);
     
-    let path = find_file_in_dirs(&filename_skill_md, &["skills"])
-        .or_else(|| find_file_in_dirs(&filename_md, &["skills"]))
+    let path = find_file_in_dirs(Kind::Skill, &filename_skill_md)
+        .or_else(|| find_file_in_dirs(Kind::Skill, &filename_md))
         .ok_or_else(|| {
-            format!("skill '{}' not found in .opencode/, .claude/, or .agents/ directories", skill_name)
+            format!("skill '{}' not found in .opencode/, .claude/, .agents/, or .pi/agent/ directories", skill_name)
         })?;
     
     let content = fs::read_to_string(&path)?;
@@ -740,9 +989,9 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 
     let mut config_content = String::new();
     for path_str in config_paths {
-        let path = if path_str.starts_with("~/") {
+        let path = if let Some(stripped) = path_str.strip_prefix("~/") {
             if let Ok(home) = env::var("HOME") {
-                PathBuf::from(home).join(&path_str[2..])
+                PathBuf::from(home).join(stripped)
             } else {
                 continue;
             }
@@ -844,12 +1093,27 @@ macro_rules! stream_agent {
                             })
                             .collect::<Vec<_>>()
                             .join("");
-                        let truncated = if result_text.len() > 200 {
-                            format!("{}... ({} bytes)", &result_text[..200], result_text.len())
+                        let limit = TOOL_OUTPUT_TRUNCATE.load(Ordering::Relaxed);
+                        if limit > 0 && result_text.len() > limit {
+                            // slice on a char boundary <= limit
+                            let mut cut = limit.min(result_text.len());
+                            while !result_text.is_char_boundary(cut) { cut -= 1; }
+                            let head = &result_text[..cut];
+                            let total = result_text.len();
+                            let spool = write_spool_file(&result_text);
+                            write!(stderr, "\x1b[2m  -> {}\x1b[0m\n",
+                                head.replace('\n', "\\n"))?;
+                            match spool {
+                                Some(p) => write!(stderr,
+                                    "\x1b[33m  ! truncated tool output: {} of {} bytes shown. full content at {} (read with: cat {})\x1b[0m\n",
+                                    cut, total, p.display(), p.display())?,
+                                None => write!(stderr,
+                                    "\x1b[33m  ! truncated tool output: {} of {} bytes shown (failed to spool full content)\x1b[0m\n",
+                                    cut, total)?,
+                            }
                         } else {
-                            result_text
-                        };
-                        write!(stderr, "\x1b[2m  -> {}\x1b[0m\n", truncated.replace('\n', "\\n"))?;
+                            write!(stderr, "\x1b[2m  -> {}\x1b[0m\n", result_text.replace('\n', "\\n"))?;
+                        }
                         stderr.flush()?;
                     }
                 }
@@ -870,51 +1134,42 @@ macro_rules! stream_agent {
 /// builds and streams an agent, conditionally adding tools based on config.
 /// uses a macro because `.tool()` changes the builder's type parameter.
 macro_rules! build_and_stream {
-    (client: $client:expr, $model_name:expr, $max_tokens:expr, $max_turns:expr, $tools:expr, $tools_override:expr, $permissions:expr, $system_prompt:expr, $user_prompt:expr) => {{
+    (client: $client:expr, $model_name:expr, $max_tokens:expr, $max_turns:expr, $tools:expr, $tools_override:expr, $permissions:expr, $hooks:expr, $system_prompt:expr, $user_prompt:expr) => {{
         let mut builder = $client.agent($model_name).max_tokens($max_tokens).default_max_turns($max_turns);
         if !$system_prompt.is_empty() {
             builder = builder.preamble($system_prompt);
         }
-        add_tools_and_stream!(builder, $tools, $tools_override, $permissions, $user_prompt);
+        add_tools_and_stream!(builder, $tools, $tools_override, $permissions, $hooks, $user_prompt);
     }};
-    (model: $model:expr, $max_tokens:expr, $max_turns:expr, $tools:expr, $tools_override:expr, $permissions:expr, $system_prompt:expr, $user_prompt:expr) => {{
+    (model: $model:expr, $max_tokens:expr, $max_turns:expr, $tools:expr, $tools_override:expr, $permissions:expr, $hooks:expr, $system_prompt:expr, $user_prompt:expr) => {{
         let mut builder = rig::agent::AgentBuilder::new($model).max_tokens($max_tokens).default_max_turns($max_turns);
         if !$system_prompt.is_empty() {
             builder = builder.preamble($system_prompt);
         }
-        add_tools_and_stream!(builder, $tools, $tools_override, $permissions, $user_prompt);
+        add_tools_and_stream!(builder, $tools, $tools_override, $permissions, $hooks, $user_prompt);
     }};
 }
 
+/// adds built-in tools (gated by `tools` config) plus all hook-registered
+/// dynamic tools, then streams the agent.
 macro_rules! add_tools_and_stream {
-    ($builder:expr, $tools:expr, $tools_override:expr, $permissions:expr, $user_prompt:expr) => {{
+    ($builder:expr, $tools:expr, $tools_override:expr, $permissions:expr, $hooks:expr, $user_prompt:expr) => {{
         let has_read = $tools.is_active("read", $tools_override);
         let has_bash = $tools.is_active("bash", $tools_override);
-        match (has_read, has_bash) {
-            (true, true) => {
-                let agent = $builder
-                    .tool(ReadTool { permissions: $permissions.clone() })
-                    .tool(BashTool { permissions: $permissions.clone() })
-                    .build();
-                stream_agent!(agent, $user_prompt);
-            }
-            (true, false) => {
-                let agent = $builder
-                    .tool(ReadTool { permissions: $permissions.clone() })
-                    .build();
-                stream_agent!(agent, $user_prompt);
-            }
-            (false, true) => {
-                let agent = $builder
-                    .tool(BashTool { permissions: $permissions.clone() })
-                    .build();
-                stream_agent!(agent, $user_prompt);
-            }
-            (false, false) => {
-                let agent = $builder.build();
-                stream_agent!(agent, $user_prompt);
-            }
-        }
+        let dyn_hook_tools = $hooks.into_dyn_tools($permissions);
+        let builder = $builder.tools(dyn_hook_tools);
+        let builder = if has_read {
+            builder.tool(ReadTool { permissions: $permissions.clone(), hooks: $hooks.clone() })
+        } else {
+            builder
+        };
+        let builder = if has_bash {
+            builder.tool(BashTool { permissions: $permissions.clone(), hooks: $hooks.clone() })
+        } else {
+            builder
+        };
+        let agent = builder.build();
+        stream_agent!(agent, $user_prompt);
     }};
 }
 
@@ -952,10 +1207,8 @@ fn get_user_prompt(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
     let mut user_prompt = args.prompt.clone()
         .or_else(|| args.prompt_positional.clone())
         .unwrap_or_default();
-    if user_prompt.is_empty() {
-        if !io::stdin().is_terminal() {
-            io::stdin().read_to_string(&mut user_prompt)?;
-        }
+    if user_prompt.is_empty() && !io::stdin().is_terminal() {
+        io::stdin().read_to_string(&mut user_prompt)?;
     }
 
     if user_prompt.trim().is_empty() {
@@ -965,6 +1218,7 @@ fn get_user_prompt(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
     Ok(user_prompt)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_stream(
     client_type: &str,
     model_name: &str,
@@ -975,9 +1229,16 @@ async fn run_agent_stream(
     tools: &ToolsConfig,
     tools_override: &Option<Vec<String>>,
     permissions: &PermissionsConfig,
+    hooks: &Arc<HookManager>,
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // rig's typestate builder requires .api_key() before .build(); when no
+    // key is configured, pass a placeholder so local openai-compatible
+    // servers (which ignore the auth header) still work. hosted providers
+    // will return a clear auth error from upstream at request time.
+    let api_key = if api_key.is_empty() { "none" } else { api_key };
+
     macro_rules! build_openai_client {
         () => {{
             let mut builder = providers::openai::Client::builder().api_key(api_key);
@@ -992,11 +1253,11 @@ async fn run_agent_stream(
         "openai_completions" => {
             let client = build_openai_client!();
             let model = client.completion_model(model_name).completions_api();
-            build_and_stream!(model: model, max_tokens, max_turns, tools, tools_override, permissions, system_prompt, user_prompt);
+            build_and_stream!(model: model, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
         },
         "openai" | "openai_responses" => {
             let client = build_openai_client!();
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, system_prompt, user_prompt);
+            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
         },
         "anthropic" => {
             let mut builder = providers::anthropic::Client::builder().api_key(api_key);
@@ -1004,7 +1265,7 @@ async fn run_agent_stream(
                 builder = builder.base_url(&url);
             }
             let client = builder.build().expect("failed to build Anthropic client");
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, system_prompt, user_prompt);
+            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
         },
         "gemini" => {
             let mut builder = providers::gemini::Client::builder().api_key(api_key);
@@ -1012,7 +1273,7 @@ async fn run_agent_stream(
                 builder = builder.base_url(&url);
             }
             let client = builder.build().expect("failed to build Gemini client");
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, system_prompt, user_prompt);
+            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
         },
         "cohere" => {
             let mut builder = providers::cohere::Client::builder().api_key(api_key);
@@ -1020,7 +1281,7 @@ async fn run_agent_stream(
                 builder = builder.base_url(&url);
             }
             let client = builder.build().expect("failed to build Cohere client");
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, system_prompt, user_prompt);
+            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
         },
         "xai" => {
             let mut builder = providers::xai::Client::builder().api_key(api_key);
@@ -1028,7 +1289,7 @@ async fn run_agent_stream(
                 builder = builder.base_url(&url);
             }
             let client = builder.build().expect("failed to build xAI client");
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, system_prompt, user_prompt);
+            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
         },
         _ => return Err(format!("unsupported client type: {}", client_type).into()),
     }
@@ -1057,7 +1318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.list_agents {
-        let items: Vec<(String, String)> = find_all_in_dirs(&["agents"]).into_iter().map(|(name, path)| {
+        let items: Vec<(String, String)> = find_all_in_dirs(Kind::Agent).into_iter().map(|(name, path)| {
             let desc = fs::read_to_string(&path).ok()
                 .and_then(|c| parse_markdown_with_frontmatter::<AgentFrontmatter>(&c).ok())
                 .and_then(|doc| doc.frontmatter.description)
@@ -1070,7 +1331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.list_skills {
-        let items: Vec<(String, String)> = find_all_in_dirs(&["skills"]).into_iter().map(|(name, path)| {
+        let items: Vec<(String, String)> = find_all_in_dirs(Kind::Skill).into_iter().map(|(name, path)| {
             let desc = fs::read_to_string(&path).ok()
                 .and_then(|c| parse_markdown_with_frontmatter::<SkillFrontmatter>(&c).ok())
                 .and_then(|doc| doc.frontmatter.description)
@@ -1082,15 +1343,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(0);
     }
 
+    let config = load_config()?;
+
+    if let Some(limit) = config.tool_output_truncate {
+        TOOL_OUTPUT_TRUNCATE.store(limit, Ordering::Relaxed);
+    }
+
+    let hooks = Arc::new(HookManager::discover());
+
     if args.list_tools {
-        print_table(&[
-            vec!["read", "read the contents of a file"],
-            vec!["bash", "execute a bash command"],
-        ]);
+        let mut rows: Vec<Vec<String>> = vec![
+            vec!["read".into(), "read the contents of a file".into()],
+            vec!["bash".into(), "execute a bash command".into()],
+        ];
+        for script in hooks.scripts() {
+            for tool in &script.tools {
+                rows.push(vec![tool.full_name.clone(), tool.description.clone()]);
+            }
+        }
+        let row_refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
+        print_table(&row_refs);
         process::exit(0);
     }
 
-    let config = load_config()?;
+    if args.list_hooks {
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for script in hooks.scripts() {
+            rows.push(vec![
+                script.name.clone(),
+                script.path.display().to_string(),
+                script.tools.iter().map(|t| t.full_name.clone()).collect::<Vec<_>>().join(","),
+            ]);
+        }
+        let row_refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
+        print_table(&row_refs);
+        process::exit(0);
+    }
 
     if args.list_providers {
         let items: Vec<(String, String, String)> = config.providers.iter().map(|p| {
@@ -1103,15 +1391,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(0);
     }
     
-    let (system_prompt, agent_model, agent_tools, agent_permissions) = if let Some(agent_name) = &args.agent_name {
+    let default_sp = config.default_system_prompt.clone().unwrap_or_default();
+    let (mut system_prompt, agent_model, agent_tools, agent_permissions) = if let Some(agent_name) = &args.agent_name {
         let agent = load_agent(agent_name)?;
         if let Some(ref override_prompt) = args.system_prompt {
             // -s overrides the entire system prompt (no agent body or skills)
             (override_prompt.clone(), agent.frontmatter.model, agent.frontmatter.tools, agent.frontmatter.permissions)
-        } else if args.skills.is_some() {
+        } else if let Some(skills) = &args.skills {
             // --skills overrides agent skills exclusively
             let mut prompt = agent.body.clone();
-            append_skills(&mut prompt, args.skills.as_ref().unwrap());
+            append_skills(&mut prompt, skills);
             (prompt, agent.frontmatter.model, agent.frontmatter.tools, agent.frontmatter.permissions)
         } else {
             let prompt = build_system_prompt(&agent);
@@ -1125,9 +1414,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (prompt, None, ToolsConfig::default(), PermissionsConfig::default())
     };
 
-    // agent frontmatter overrides config
+    // fall back to config.default_system_prompt when nothing else set one
+    if system_prompt.is_empty() && !default_sp.is_empty() {
+        system_prompt = default_sp;
+    }
+
+    // agent frontmatter overrides config; --permissions-* override both.
+    // applied in order: allow, ask, deny — so within a single invocation,
+    // deny wins over ask wins over allow for the same target.
     let tools = config.tools.clone().merge(agent_tools);
-    let permissions = config.permissions.clone().merge(agent_permissions);
+    let mut perm_overrides: Vec<PermissionOverride> = Vec::new();
+    for (tool, pattern) in &args.permissions_allow {
+        perm_overrides.push(PermissionOverride { tool: tool.clone(), pattern: pattern.clone(), level: PermissionLevel::Allow });
+    }
+    for (tool, pattern) in &args.permissions_ask {
+        perm_overrides.push(PermissionOverride { tool: tool.clone(), pattern: pattern.clone(), level: PermissionLevel::Ask });
+    }
+    for (tool, pattern) in &args.permissions_deny {
+        perm_overrides.push(PermissionOverride { tool: tool.clone(), pattern: pattern.clone(), level: PermissionLevel::Deny });
+    }
+    let permissions = config.permissions.clone()
+        .merge(agent_permissions)
+        .apply_overrides(&perm_overrides);
+
+    if args.list_permissions {
+        print_permissions(&permissions);
+        process::exit(0);
+    }
+
+    // hook protocol: append `mutate_request` system prompt fragments
+    // (joined with blank lines) to whatever the agent already composed.
+    for fragment in hooks.mutate_request() {
+        if !system_prompt.is_empty() {
+            system_prompt.push_str("\n\n");
+        }
+        system_prompt.push_str(&fragment);
+    }
+
+    // markdown agent bodies and skills routinely leave trailing/leading
+    // blank lines from the frontmatter split; strip them so the prompt
+    // sent to the model is tidy.
+    let system_prompt = system_prompt.trim().to_string();
 
     let user_prompt = match get_user_prompt(&args) {
         Ok(p) => p,
@@ -1174,10 +1501,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let base_url = provider_config.base_url.clone();
 
-    if api_key.is_empty() && !args.dry_run {
-        eprintln!("error: no API key found for provider '{}'. configure it in ~/.config/airun/config.toml or export it as an environment variable.", provider_name);
-        process::exit(1);
-    }
+    // no preflight on api_key: providers that don't require auth (e.g. local
+    // openai-compatible servers) work keyless; hosted providers will return a
+    // clear auth error from the upstream API at request time.
 
     if args.verbose {
         tracing_subscriber::fmt()
@@ -1208,10 +1534,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("max_tokens: {}", max_tokens);
         println!("max_turns: {}", max_turns);
 
-        let active_tools: Vec<&str> = ["read", "bash"].iter()
+        let mut active_tools: Vec<String> = ["read", "bash"].iter()
             .filter(|t| tools.is_active(t, &args.tools))
-            .copied()
+            .map(|s| s.to_string())
             .collect();
+        for script in hooks.scripts() {
+            for tool in &script.tools {
+                active_tools.push(tool.full_name.clone());
+            }
+        }
         println!("\n--- tools ---");
         if active_tools.is_empty() {
             println!("(none)");
@@ -1223,8 +1554,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("\n--- permissions ---");
         for name in &active_tools {
-            if let Some(perm) = permissions.tools.get(*name) {
-                println!("{}: {:?}", name, perm);
+            match permissions.tools.get(name) {
+                Some(perm) => println!("{}: {:?}", name, perm),
+                None => println!("{}: (unset, defaults to deny)", name),
+            }
+        }
+
+        if !hooks.scripts().is_empty() {
+            println!("\n--- hooks ---");
+            for script in hooks.scripts() {
+                let tool_list: Vec<&str> = script.tools.iter().map(|t| t.full_name.as_str()).collect();
+                println!("{}  {}  [{}]", script.name, script.path.display(), tool_list.join(","));
             }
         }
 
@@ -1234,6 +1574,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n--- user prompt ---");
         println!("{}", user_prompt);
 
+        return Ok(());
+    }
+
+    if args.dump_request {
+        let mut tool_defs: Vec<serde_json::Value> = Vec::new();
+        if tools.is_active("read", &args.tools) {
+            tool_defs.push(tool_def_as_function(&read_tool_definition()));
+        }
+        if tools.is_active("bash", &args.tools) {
+            tool_defs.push(tool_def_as_function(&bash_tool_definition()));
+        }
+        for script in hooks.scripts() {
+            for t in &script.tools {
+                tool_defs.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.full_name,
+                        "description": t.description,
+                        "parameters": t.parameters_schema,
+                    }
+                }));
+            }
+        }
+        let mut messages = Vec::new();
+        if !system_prompt.is_empty() {
+            messages.push(serde_json::json!({"role": "system", "content": system_prompt}));
+        }
+        messages.push(serde_json::json!({"role": "user", "content": user_prompt}));
+        let mut request = serde_json::json!({
+            "model": model_name,
+            "max_tokens": max_tokens,
+            "messages": messages,
+        });
+        if !tool_defs.is_empty() {
+            request["tools"] = serde_json::Value::Array(tool_defs);
+        }
+        println!("{}", serde_json::to_string_pretty(&request)?);
         return Ok(());
     }
 
@@ -1247,6 +1624,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &tools,
         &args.tools,
         &permissions,
+        &hooks,
         &system_prompt,
         &user_prompt,
     ).await
@@ -1255,6 +1633,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- read tool slicing ---
+
+    #[test]
+    fn test_slice_lines_no_args_returns_full() {
+        let s = "a\nb\nc";
+        assert_eq!(slice_lines(s, None, None), s);
+    }
+
+    #[test]
+    fn test_slice_lines_offset_only() {
+        let s = "a\nb\nc\nd";
+        assert_eq!(slice_lines(s, Some(1), None), "b\nc\nd");
+    }
+
+    #[test]
+    fn test_slice_lines_offset_and_count() {
+        let s = "a\nb\nc\nd\ne";
+        assert_eq!(slice_lines(s, Some(1), Some(2)), "b\nc");
+    }
+
+    #[test]
+    fn test_slice_lines_count_past_end_is_clamped() {
+        let s = "a\nb";
+        assert_eq!(slice_lines(s, Some(0), Some(99)), "a\nb");
+    }
+
+    #[test]
+    fn test_slice_lines_offset_past_end_returns_empty() {
+        assert_eq!(slice_lines("a\nb", Some(99), None), "");
+    }
 
     // --- bash command validation ---
 

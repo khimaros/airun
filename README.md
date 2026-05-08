@@ -98,6 +98,13 @@ example configuration:
 default_model = "anthropic/claude-sonnet-4-20250514"
 default_max_tokens = 16384
 
+# fallback when no -s flag and no agent body sets one
+default_system_prompt = "you are a helpful assistant."
+
+# stderr tool-output cap in bytes; full output is spooled to
+# $XDG_CACHE_HOME/airun/<pid>/<seq>.txt when exceeded. 0 disables.
+tool_output_truncate = 2000
+
 [[providers]]
 name = "anthropic"
 client = "anthropic"
@@ -117,12 +124,12 @@ base_url = "http://localhost:7860/v1"
 
 supported client types: `openai` (responses API), `openai_completions`, `anthropic`, `gemini`, `cohere`, `xai`.
 
-if no API key is set in the config, `airun` falls back to the corresponding environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `COHERE_API_KEY`, `XAI_API_KEY`).
+if no API key is set in the config, `airun` falls back to the corresponding environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `COHERE_API_KEY`, `XAI_API_KEY`). if neither is present, requests are sent without auth — fine for local openai-compatible servers that don't require it; hosted providers will return an upstream auth error.
 
 ### tools and permissions
 
 tools can be registered with the LLM via config or the `--tools` flag. supported tools:
-- `read` — read file contents at a given path
+- `read` — read file contents at a given path; optional `offset` (0-indexed start line) and `count` (number of lines) for slicing
 - `bash` — execute shell commands via `sh -c`
 
 ```toml
@@ -157,6 +164,39 @@ a trailing ` *` or ` **` in a pattern also matches the command with no arguments
 
 when a bash command contains shell metacharacters (pipes, redirects, chaining, etc.), it cannot be safely matched against patterns, so the catch-all (`*`) permission level is used instead.
 
+### hooks
+
+hooks are external executables that extend airun without recompiling. they live under `hooks/` in the same base directories as agents and skills (`.opencode/hooks/`, `.claude/hooks/`, `.agents/hooks/`, plus the global equivalents).
+
+each script is invoked as `<script> <stage>`, with a single JSON object on stdin and JSONL on stdout. supported stages:
+
+- `discover` — called once at startup to register the hook and its custom tools.
+- `mutate_request` — returned `system` strings are appended to the agent's system prompt.
+- `execute_tool` — called when the LLM invokes a hook-registered tool.
+- `tool_before` / `tool_after` — observational, fired around every tool call.
+
+```sh
+#!/bin/sh
+# .agents/hooks/persona.sh
+case "$1" in
+  discover)
+    cat <<'EOF'
+{"name":"persona","tools":[{"name":"trait","description":"read a persona trait","parameters":{"key":"trait name"}}]}
+EOF
+    ;;
+  mutate_request)
+    echo '{"system":["respond as a terse rust hacker."]}'
+    ;;
+  execute_tool)
+    echo '{"result":"persona response"}'
+    ;;
+esac
+```
+
+the script must be executable. files starting with `.` or `__` are ignored. tool names are namespaced as `<prefix>_<short>` (here, `persona_trait`).
+
+airun implements the v1 protocol with partial conformance — session-bound stages (`idle`, `heartbeat`, `compacting`, `recover`, `format_notification`, `observe_message`, `actions`) and the `prompts/` contract are not implemented. see [DESIGN.md](DESIGN.md) for the rationale.
+
 ## usage
 
 ```
@@ -176,7 +216,11 @@ the prompt can be provided as a positional argument after the agent name, via `-
 | `-t, --max-tokens <N>` | maximum output tokens (default: 16384) |
 | `--tools <LIST>` | enable specific tools exclusively (comma-separated, e.g. `read,bash`) |
 | `--skills <LIST>` | use specific skills exclusively (comma-separated, overrides agent) |
-| `-n, --dry-run` | print what would be sent to the LLM and exit |
+| `--permissions-allow <TOOL[:PATTERN]>` | override permission to `allow` (repeatable, e.g. `'bash:apt update'`) |
+| `--permissions-ask <TOOL[:PATTERN]>` | override permission to `ask` (repeatable) |
+| `--permissions-deny <TOOL[:PATTERN]>` | override permission to `deny` (repeatable) |
+| `-n, --dry-run` | print a human-readable summary of what would be sent and exit |
+| `-D, --dump-request` | dump the exact JSON request body (OpenAI chat-completions shape) and exit |
 | `-q, --quiet` | suppress thinking and tool call output on stderr |
 | `-y, --yes` | auto-accept "ask" permission prompts |
 | `-v, --verbose` | enable verbose/debug logging |
@@ -184,6 +228,8 @@ the prompt can be provided as a positional argument after the agent name, via `-
 | `--list-skills` | list discovered skills |
 | `--list-tools` | list available tools |
 | `--list-providers` | list configured providers |
+| `--list-hooks` | list discovered hook scripts and their registered tools |
+| `--list-permissions` | print resolved permissions (after merging config + agent + `--permissions`) |
 
 the response stream is written to stdout. reasoning tokens (from compatible models) are written to stderr in dim italic. tool calls and results are logged to stderr.
 
