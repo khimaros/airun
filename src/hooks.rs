@@ -1,13 +1,14 @@
-// hook protocol v1 (partial conformance) — see DESIGN.md and
-// docs/HOOK_PROTOCOL.md (in opencode-evolve). only the stages that fit
-// a one-shot, sessionless cli are implemented:
+// harness control protocol, tier 0 of https://github.com/khimaros/hcp-spec/.
+// stages:
 //
-//   discover, mutate_request, execute_tool, tool_before, tool_after
+//   discover, mutate_request, execute_tool, before_tool, after_tool
 //
-// stages tied to long-running sessions (idle, heartbeat, compacting,
-// recover, format_notification, observe_message, actions) are skipped.
-// the prompts/ contract is also deferred — hooks compose their own
-// system strings via mutate_request.
+// plus tier 1's `before_stop` (fired post-loop with the final transcript).
+// remaining tier 1 / 2 stages (before_turn, after_turn, on_error,
+// on_permission) are not yet implemented; see the hcp-spec.
+//
+// every payload includes a `host` capability block: {name, version, stages}.
+// scripts can read it to gate behavior on host or protocol version.
 
 use rig::completion::ToolDefinition;
 use rig::tool::{ToolDyn, ToolError};
@@ -74,6 +75,22 @@ pub struct HookToolDef {
     pub permission_args: Vec<String>,
 }
 
+/// mutations a `before_tool` hook can request. when both `deny` and
+/// `result` are set, `deny` wins (the call is refused, no synthetic
+/// result is substituted).
+#[derive(Debug, Default)]
+pub struct BeforeToolResult {
+    pub deny: Option<String>,
+    pub result: Option<String>,
+}
+
+/// mutations an `after_tool` hook can request. `result` replaces the
+/// text fed back to the model.
+#[derive(Debug, Default)]
+pub struct AfterToolResult {
+    pub result: Option<String>,
+}
+
 /// orchestrates the lifecycle of all discovered hook scripts.
 #[derive(Debug, Default, Clone)]
 pub struct HookManager {
@@ -109,10 +126,28 @@ impl HookManager {
         &self.scripts
     }
 
+    /// retains only hooks whose name passes the given filter. used to
+    /// apply the `[hooks]` config section after discovery.
+    pub fn retain<F: Fn(&str) -> bool>(mut self, filter: F) -> Self {
+        self.scripts.retain(|s| filter(&s.name));
+        self
+    }
+
     /// runs `mutate_request` on every script and returns concatenated
-    /// system prompt fragments in alphabetical script order.
-    pub fn mutate_request(&self) -> Vec<String> {
-        let input = json!({"hook": "mutate_request", "session": {"id": "airun"}, "history": []});
+    /// system prompt fragments in alphabetical script order. the payload
+    /// includes the finalized system prompt, user prompt, model id, and
+    /// a one-message history so observational hooks can inspect the full
+    /// request that's about to go to the LLM.
+    pub fn mutate_request(&self, system_prompt: &str, user_prompt: &str, model: &str) -> Vec<String> {
+        let input = json!({
+            "hook": "mutate_request",
+            "host": host_capability(),
+            "session": {"id": "airun"},
+            "system": system_prompt,
+            "user": user_prompt,
+            "history": [{"role": "user", "content": user_prompt}],
+            "model": model,
+        });
         let mut systems = Vec::new();
         for script in &self.scripts {
             match invoke(script, "mutate_request", &input) {
@@ -131,33 +166,78 @@ impl HookManager {
         systems
     }
 
-    /// observational. fired before any tool call (built-in or hook-registered).
-    pub fn tool_before(&self, tool: &str, call_id: &str, args: &Value) {
+    /// fired before any tool call (built-in or hook-registered). hooks
+    /// can return `{"deny": "<reason>"}` to refuse the call or
+    /// `{"result": "..."}` to substitute a synthetic result without
+    /// running the tool.
+    pub fn before_tool(&self, tool: &str, call_id: &str, args: &Value) -> BeforeToolResult {
         let input = json!({
-            "hook": "tool_before",
+            "hook": "before_tool",
+            "host": host_capability(),
             "session": {"id": "airun"},
             "tool": tool,
             "callID": call_id,
             "args": args,
         });
+        let mut accum = serde_json::Map::new();
         for script in &self.scripts {
-            // observational: failures are logged but ignored.
-            let _ = invoke(script, "tool_before", &input);
+            if let Ok(Value::Object(merged)) = invoke(script, "before_tool", &input) {
+                for (k, v) in merged {
+                    merge_field(&mut accum, k, v);
+                }
+            }
+        }
+        BeforeToolResult {
+            deny: accum.get("deny").and_then(|v| v.as_str().map(|s| s.to_string())),
+            result: accum.get("result").and_then(|v| v.as_str().map(|s| s.to_string())),
         }
     }
 
-    /// observational. fired after any tool call completes.
-    pub fn tool_after(&self, tool: &str, call_id: &str, output: &str) {
+    /// fired after any tool call completes. hooks can return
+    /// `{"result": "..."}` to replace the result text fed back to the
+    /// model.
+    pub fn after_tool(&self, tool: &str, call_id: &str, output: &str) -> AfterToolResult {
         let input = json!({
-            "hook": "tool_after",
+            "hook": "after_tool",
+            "host": host_capability(),
             "session": {"id": "airun"},
             "tool": tool,
             "callID": call_id,
             "title": tool,
             "output": output,
         });
+        let mut accum = serde_json::Map::new();
         for script in &self.scripts {
-            let _ = invoke(script, "tool_after", &input);
+            if let Ok(Value::Object(merged)) = invoke(script, "after_tool", &input) {
+                for (k, v) in merged {
+                    merge_field(&mut accum, k, v);
+                }
+            }
+        }
+        AfterToolResult {
+            result: accum.get("result").and_then(|v| v.as_str().map(|s| s.to_string())),
+        }
+    }
+
+    /// fired once after the streaming loop terminates (whether by natural
+    /// stop, max_turns, error, or cancel). observational only in airun's
+    /// current implementation; `continue` responses are noted but not
+    /// honored (no re-entry).
+    pub fn before_stop(&self, exit_reason: &str, error: Option<&str>) {
+        let mut payload = json!({
+            "hook": "before_stop",
+            "host": host_capability(),
+            "session": {"id": "airun"},
+            "exit_reason": exit_reason,
+            "final": true,
+        });
+        if let Some(e) = error {
+            payload["error"] = json!(e);
+        }
+        for script in &self.scripts {
+            if let Err(e) = invoke(script, "before_stop", &payload) {
+                eprintln!("hook before_stop failed for {}: {}", script.name, e);
+            }
         }
     }
 
@@ -219,22 +299,31 @@ impl ToolDyn for HookTool {
 
             let script = &self.manager.scripts[self.script_idx];
             let call_id = format!("{}-{}", self.tool.full_name, std::process::id());
-            self.manager.tool_before(&self.tool.full_name, &call_id, &parsed);
+            let before = self.manager.before_tool(&self.tool.full_name, &call_id, &parsed);
+            if let Some(reason) = before.deny {
+                return Err(ToolError::ToolCallError(format!("denied by hook: {}", reason).into()));
+            }
 
-            let input = json!({
-                "hook": "execute_tool",
-                "tool": self.tool.short_name,
-                "args": parsed,
-            });
-            let merged = invoke(script, "execute_tool", &input)
-                .map_err(|e| ToolError::ToolCallError(e.into()))?;
-            let result_text = merged.get("result")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            let result_text = if let Some(synthetic) = before.result {
+                // hook substituted a synthetic result; skip execution.
+                synthetic
+            } else {
+                let input = json!({
+                    "hook": "execute_tool",
+                    "host": host_capability(),
+                    "tool": self.tool.short_name,
+                    "args": parsed,
+                });
+                let merged = invoke(script, "execute_tool", &input)
+                    .map_err(|e| ToolError::ToolCallError(e.into()))?;
+                merged.get("result")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            };
 
-            self.manager.tool_after(&self.tool.full_name, &call_id, &result_text);
-            Ok(result_text)
+            let after = self.manager.after_tool(&self.tool.full_name, &call_id, &result_text);
+            Ok(after.result.unwrap_or(result_text))
         })
     }
 }
@@ -334,9 +423,20 @@ fn is_executable(_path: &Path) -> bool {
     true
 }
 
+/// host capability payload sent on every hook invocation. version is the
+/// protocol version the host implements; stages enumerates the canonical
+/// stage names this host actually fires.
+fn host_capability() -> Value {
+    json!({
+        "name": "airun",
+        "version": 2,
+        "stages": ["discover", "mutate_request", "before_tool", "after_tool", "execute_tool", "before_stop"],
+    })
+}
+
 /// runs `discover` on a script, populating its name/test/tools fields in place.
 fn run_discover(script: &mut HookScript) -> Result<(), String> {
-    let input = json!({"hook": "discover"});
+    let input = json!({"hook": "discover", "host": host_capability()});
     let merged = invoke(script, "discover", &input)?;
     let parsed: DiscoverResponse = serde_json::from_value(merged)
         .map_err(|e| format!("invalid discover response: {}", e))?;
@@ -365,7 +465,7 @@ fn run_discover(script: &mut HookScript) -> Result<(), String> {
     Ok(())
 }
 
-/// JSON-schema types accepted in `discover` per § discover.
+/// JSON-schema types accepted in the `discover` stage.
 const PROTOCOL_TYPES: &[&str] = &["string", "number", "boolean", "object", "array", "any"];
 
 /// builds a JSON-schema `parameters` object from the hook's three
@@ -388,11 +488,30 @@ fn build_parameters_schema(params: &HashMap<String, Value>) -> Value {
                         prop.insert(k.clone(), v.clone());
                     }
                 }
-                // omit `type: "any"` — it isn't standard JSON Schema.
+                // omit `type: "any"`; it isn't standard JSON Schema.
                 if matches!(prop.get("type"), Some(Value::String(s)) if s == "any") {
                     prop.remove("type");
                 } else if !prop.contains_key("type") {
                     prop.insert("type".to_string(), json!("string"));
+                }
+                // expand `array[T]` shorthand into the canonical
+                // `{"type": "array", "items": {"type": T}}` form. the
+                // literal "array[string]" string is not a valid JSON
+                // Schema type, so OpenAI-compatible providers reject it.
+                if let Some(Value::String(t)) = prop.get("type").cloned() {
+                    if let Some(rest) = t.strip_prefix("array[") {
+                        if let Some(inner) = rest.strip_suffix(']') {
+                            prop.insert("type".to_string(), json!("array"));
+                            if !prop.contains_key("items") {
+                                let items_type = if inner == "any" {
+                                    json!({})
+                                } else {
+                                    json!({"type": inner})
+                                };
+                                prop.insert("items".to_string(), items_type);
+                            }
+                        }
+                    }
                 }
                 (Value::Object(prop), optional)
             }
@@ -460,9 +579,9 @@ fn type_matches(ty: &str, value: &Value) -> bool {
         "boolean" => value.is_boolean(),
         "object" => value.is_object(),
         "array" => value.is_array(),
-        // "any" is normalized away in build_parameters_schema, but be
-        // defensive — also treat unknown types as permissive rather than
-        // rejecting valid hook authors.
+        // "any" is normalized away in build_parameters_schema; treat any
+        // other unknown type as permissive rather than rejecting valid
+        // hook authors.
         "any" => true,
         other => !PROTOCOL_TYPES.contains(&other),
     }
@@ -481,19 +600,47 @@ fn value_type_name(v: &Value) -> &'static str {
 
 /// invokes a hook script with the given stage, writes the input json on
 /// stdin (terminated by EOF), and merges every JSONL line of stdout into
-/// a single Value per § composability.
+/// a single Value per the composability rules.
 fn invoke(script: &HookScript, stage: &str, input: &Value) -> Result<Value, String> {
-    let mut child = Command::new(&script.path)
-        .arg(stage)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("spawn {}: {}", script.path.display(), e))?;
+    // ETXTBSY (errno 26) can fire when another thread is mid-write on a
+    // sibling executable: that thread's open write fd is inherited by
+    // our fork()ed child before its exec(), and the kernel refuses to
+    // exec any binary that still has a writer somewhere in the system.
+    // benign and self-clearing once the writer finishes; retry a few
+    // times with a short backoff before surfacing the error.
+    const ETXTBSY: i32 = 26;
+    let mut child = {
+        let mut attempt = 0u32;
+        loop {
+            match Command::new(&script.path)
+                .arg(stage)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+            {
+                Ok(c) => break c,
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < 20 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => return Err(format!("spawn {}: {}", script.path.display(), e)),
+            }
+        }
+    };
 
     if let Some(mut stdin) = child.stdin.take() {
         let payload = serde_json::to_vec(input).map_err(|e| format!("encode input: {}", e))?;
-        stdin.write_all(&payload).map_err(|e| format!("write stdin: {}", e))?;
+        // hook scripts may exit without consuming stdin (e.g. when they
+        // don't handle the requested stage). that closes their read end
+        // before our write completes and the kernel returns EPIPE, which
+        // is not an error from the host's perspective. swallow it.
+        if let Err(e) = stdin.write_all(&payload) {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(format!("write stdin: {}", e));
+            }
+        }
     }
 
     let output = child.wait_with_output().map_err(|e| format!("wait: {}", e))?;
@@ -532,7 +679,7 @@ fn invoke(script: &HookScript, stage: &str, input: &Value) -> Result<Value, Stri
     Ok(Value::Object(merged))
 }
 
-/// merges a single (k, v) into the accumulator per § composability:
+/// merges a single (k, v) into the accumulator per the composability rules:
 /// arrays concatenate, scalars join with newline.
 const ARRAY_FIELDS: &[&str] = &["system", "tools", "notifications", "actions", "modified", "notify"];
 const SCALAR_FIELDS: &[&str] = &["continue", "prompt", "user", "message", "result"];
@@ -598,6 +745,28 @@ mod tests {
     }
 
     #[test]
+    fn parameters_schema_array_shorthand_expands_to_items() {
+        // `type: "array[string]"` is the hello hook's shorthand for an
+        // array of strings. it must expand to the canonical JSON-schema
+        // form so OpenAI tool-schema validators accept it.
+        let mut params = HashMap::new();
+        params.insert("tags".to_string(), json!({"type": "array[string]", "description": "tags"}));
+        let schema = build_parameters_schema(&params);
+        assert_eq!(schema["properties"]["tags"]["type"], json!("array"));
+        assert_eq!(schema["properties"]["tags"]["items"], json!({"type": "string"}));
+    }
+
+    #[test]
+    fn parameters_schema_array_any_shorthand_drops_items_type() {
+        // `array[any]` should produce items with no constraint.
+        let mut params = HashMap::new();
+        params.insert("blob".to_string(), json!({"type": "array[any]"}));
+        let schema = build_parameters_schema(&params);
+        assert_eq!(schema["properties"]["blob"]["type"], json!("array"));
+        assert_eq!(schema["properties"]["blob"]["items"], json!({}));
+    }
+
+    #[test]
     fn parameters_schema_any_type_is_stripped() {
         let mut params = HashMap::new();
         params.insert("blob".to_string(), json!({"type": "any", "description": "anything"}));
@@ -650,5 +819,164 @@ mod tests {
         assert_eq!(schema["required"], json!([]));
         // "optional" key should not leak into the JSON-schema property
         assert!(schema["properties"]["tz"].get("optional").is_none());
+    }
+
+    #[test]
+    fn host_capability_advertises_canonical_stages() {
+        // protocol contract: host advertises the canonical stage names.
+        // legacy/predecessor names (`tool_before`, `tool_after`, `idle`)
+        // must not appear.
+        let host = host_capability();
+        assert_eq!(host["name"], json!("airun"));
+        assert_eq!(host["version"], json!(2));
+        let stages = host["stages"].as_array().expect("stages is array");
+        let names: Vec<&str> = stages.iter().filter_map(|v| v.as_str()).collect();
+        for required in ["discover", "mutate_request", "before_tool", "after_tool", "execute_tool", "before_stop"] {
+            assert!(names.contains(&required), "missing stage {}", required);
+        }
+        for forbidden in ["tool_before", "tool_after", "idle"] {
+            assert!(!names.contains(&forbidden), "predecessor stage {} leaked into host stages", forbidden);
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_capture_script(dir: &std::path::Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        // dump the inbound stdin payload to a sibling .log file so the
+        // test can read it back without parsing stderr.
+        let body = format!(r#"#!/bin/sh
+cat > "{}.log"
+"#, path.display());
+        std::fs::write(&path, body).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn read_payload(script_path: &Path) -> Value {
+        let log = std::fs::read_to_string(format!("{}.log", script_path.display())).unwrap();
+        serde_json::from_str(&log).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn before_stop_payload_includes_exit_reason_and_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_capture_script(dir.path(), "stop.sh");
+        let manager = HookManager {
+            scripts: vec![HookScript {
+                name: "stop".into(),
+                path: path.clone(),
+                test: None,
+                tools: Vec::new(),
+            }],
+        };
+        manager.before_stop("stop", None);
+        let payload = read_payload(&path);
+        assert_eq!(payload["hook"], json!("before_stop"));
+        assert_eq!(payload["exit_reason"], json!("stop"));
+        assert_eq!(payload["final"], json!(true));
+        assert!(payload.get("error").is_none());
+        assert_eq!(payload["host"]["version"], json!(2));
+    }
+
+    #[cfg(unix)]
+    fn write_response_script(dir: &std::path::Path, name: &str, jsonl: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        // emit fixed JSONL on every stage; lets tests pin response parsing.
+        let body = format!(r#"#!/bin/sh
+cat > /dev/null
+cat <<'EOF'
+{}
+EOF
+"#, jsonl);
+        std::fs::write(&path, body).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn manager_with(path: PathBuf, name: &str) -> HookManager {
+        HookManager {
+            scripts: vec![HookScript {
+                name: name.into(),
+                path,
+                test: None,
+                tools: Vec::new(),
+            }],
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn before_tool_parses_deny_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_response_script(dir.path(), "deny.sh", r#"{"deny": "policy says no"}"#);
+        let m = manager_with(path, "deny");
+        let r = m.before_tool("read", "c1", &json!({"path": "/etc/passwd"}));
+        assert_eq!(r.deny.as_deref(), Some("policy says no"));
+        assert!(r.result.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn before_tool_parses_synthetic_result_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_response_script(dir.path(), "synth.sh", r#"{"result": "cached value"}"#);
+        let m = manager_with(path, "synth");
+        let r = m.before_tool("read", "c1", &json!({"path": "/x"}));
+        assert!(r.deny.is_none());
+        assert_eq!(r.result.as_deref(), Some("cached value"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn after_tool_parses_result_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_response_script(dir.path(), "rewrite.sh", r#"{"result": "REWRITTEN"}"#);
+        let m = manager_with(path, "rewrite");
+        let r = m.after_tool("read", "c1", "original");
+        assert_eq!(r.result.as_deref(), Some("REWRITTEN"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn before_tool_payload_contains_v2_call_id_and_host() {
+        // wire-contract: payload uses callID + host capability + v2 stage name.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_capture_script(dir.path(), "cap.sh");
+        let m = manager_with(path.clone(), "cap");
+        m.before_tool("read", "abc-123", &json!({"path": "/x"}));
+        let payload = read_payload(&path);
+        assert_eq!(payload["hook"], json!("before_tool"));
+        assert_eq!(payload["tool"], json!("read"));
+        assert_eq!(payload["callID"], json!("abc-123"));
+        assert_eq!(payload["args"]["path"], json!("/x"));
+        assert_eq!(payload["host"]["version"], json!(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn before_stop_payload_carries_error_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_capture_script(dir.path(), "err.sh");
+        let manager = HookManager {
+            scripts: vec![HookScript {
+                name: "err".into(),
+                path: path.clone(),
+                test: None,
+                tools: Vec::new(),
+            }],
+        };
+        manager.before_stop("error", Some("network broke"));
+        let payload = read_payload(&path);
+        assert_eq!(payload["exit_reason"], json!("error"));
+        assert_eq!(payload["error"], json!("network broke"));
     }
 }

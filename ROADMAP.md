@@ -1,7 +1,5 @@
 # roadmap
 
-- [x] initialize project
-- [x] define requirements
 - [x] implement toml configuration parsing
 - [x] implement markdown agent/skill parsing from `.claude/` and `.opencode/`
 - [x] implement openai api streaming client
@@ -23,17 +21,24 @@
 - [x] --skills flag for exclusive skill override
 - [x] show usage on empty prompt (exit non-zero)
 - [x] fix find_all_in_dirs double-nesting base directories for global paths
-- [x] hook protocol v1 (partial conformance, see DESIGN.md):
+- [x] hook protocol (partial conformance, see the [hcp-spec](https://github.com/khimaros/hcp-spec/) and DESIGN.md):
   - [x] discover hooks from `hooks/` under existing base dirs (.claude/.opencode/.agents, plus globals)
   - [x] `discover` stage at startup: register hook tools (`<prefix>_<tool_name>`)
-  - [x] `mutate_request` stage: merge returned `system` strings into the system prompt
+  - [x] `mutate_request` stage: merge returned `system` strings into the system prompt; payload includes finalized system/user/model/tools
   - [x] `execute_tool` stage: route invocations of hook-registered tools back to the owning script
-  - [x] `tool_before` / `tool_after` observational stages around built-in `read` and `bash`
+  - [x] `before_tool` / `after_tool` stages around built-in `read` / `bash` and hook-registered tools, with `deny` / `args` / `result` mutation responses
+  - [x] `before_stop` post-loop observational stage with `exit_reason` / `final` / `error`
   - [x] honor `permission.arg` for hook tools (route through existing `check_tool_permission`)
   - [x] `--list-hooks` flag
   - [x] hook tools appear in `--list-tools`
   - [x] typed parameters: validate args (required, type, enum) before `execute_tool`; normalize `any` type
   - [x] dry-run inclusion of hooks (own section + tools/permissions list)
+  - [x] host capability payload (`{name, version, stages}`) on every hook invocation
+- [ ] hook protocol, tier 1/2 follow-ups:
+  - [ ] `before_stop.continue` re-entry into the agent loop (wire format honored; needs plumbing user-prompt re-injection back into `run_agent_stream`)
+  - [ ] `max_turns` distinction in `before_stop.exit_reason` (today everything reports `"stop"` or `"error"`; needs rig surfacing the loop-exit cause)
+  - [ ] `before_turn` / `after_turn` stages
+  - [ ] `on_error` / `on_permission` stages
 - [x] `--dump-request` (`-D`) flag emits exact OpenAI chat-completions JSON request body
 - [x] `make precommit` target (lint + test + build)
 - [x] configurable tool-call output truncation (stderr display); full content spooled to `$XDG_CACHE_HOME/airun/<pid>/<seq>.txt` with a clear warning

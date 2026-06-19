@@ -1,1 +1,3 @@
 /target
+tests/.artifacts/
+__pycache__

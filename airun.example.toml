@@ -15,16 +15,21 @@
 # set to 0 to disable truncation entirely (default: 2000)
 #tool_output_truncate = 2000
 
-# tools: register tools with the LLM (default: false, enable with --tools flag)
+# tools: register tools with the LLM. keys are gitignore-style globs
+# matched against the tool name; most specific match wins. unmatched
+# tools default to false. use "*" to set a default for all.
 #[tools]
-#read = false
-#bash = false
+#"*" = false
+#read = true
+#bash = true
 
-# permissions: control access levels (allow/ask/deny) per tool
-# can be a single level or a map of patterns (most specific match wins)
+# permissions: control access levels (allow/ask/deny) per tool. the
+# outer key is also a glob over tool names (most specific wins,
+# default deny). the inner value is either a single level or a
+# pattern map keyed by gitignore-style globs.
 #[permissions]
+#"*" = "deny"
 #read = "allow"
-#bash = "deny"
 # or with gitignore-style glob patterns (most specific wins):
 #[permissions.read]
 #"**" = "allow"
@@ -32,6 +37,21 @@
 #[permissions.bash]
 #"**" = "deny"
 #"apt update" = "allow"
+
+# hooks: gate which discovered hook scripts are loaded. keyed by the
+# hook's declared `name` (returned in `discover`, defaulting to file
+# stem). same glob semantics as [tools]; default false.
+#[hooks]
+#"*" = false
+#observe = true
+#datetime = true
+
+# skills: gate which skills can be loaded into a system prompt. keyed
+# by skill name (the file stem). same glob semantics as [tools];
+# default false.
+#[skills]
+#"*" = false
+#init = true
 
 #[[providers]]
 #name = "openai-compatible"

@@ -1,8 +1,8 @@
 # airun
 
-unix philosophy for the agentic future. pipe a prompt in, get a streaming response out.
+built on the unix philosophy: pipe a prompt in, get a streaming response out.
 
-`airun` is a simple, one-shot agent runner compatible with `.claude/` and `.opencode/` directory structures. agents and skills are plain markdown files with yaml frontmatter — no frameworks, no daemons, no lock-in.
+`airun` is a one-shot agent runner compatible with `.claude/` and `.opencode/` directory structures. agents and skills are plain markdown files with yaml frontmatter.
 
 supports OpenAI, Anthropic, Gemini, Cohere, xAI, and OpenAI-compatible endpoints. written in Rust with minimal dependencies.
 
@@ -40,7 +40,7 @@ Filesystem  Use% Avail
 /           42%  120G
 ```
 
-agents have scoped tools and permissions, so `admin` can run `bash` commands while other agents cannot. the response streams to stdout, tool calls log to stderr — composable with standard unix pipes and redirects.
+agents have scoped tools and permissions, so `admin` can run `bash` commands while other agents cannot. the response streams to stdout, tool calls log to stderr, composable with standard unix pipes and redirects.
 
 ## agents and skills
 
@@ -124,13 +124,13 @@ base_url = "http://localhost:7860/v1"
 
 supported client types: `openai` (responses API), `openai_completions`, `anthropic`, `gemini`, `cohere`, `xai`.
 
-if no API key is set in the config, `airun` falls back to the corresponding environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `COHERE_API_KEY`, `XAI_API_KEY`). if neither is present, requests are sent without auth — fine for local openai-compatible servers that don't require it; hosted providers will return an upstream auth error.
+if no API key is set in the config, `airun` falls back to the corresponding environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `COHERE_API_KEY`, `XAI_API_KEY`). if neither is present, requests are sent without auth; this is fine for local openai-compatible servers that don't require it, while hosted providers will return an upstream auth error.
 
 ### tools and permissions
 
 tools can be registered with the LLM via config or the `--tools` flag. supported tools:
-- `read` — read file contents at a given path; optional `offset` (0-indexed start line) and `count` (number of lines) for slicing
-- `bash` — execute shell commands via `sh -c`
+- `read`: read file contents at a given path; optional `offset` (0-indexed start line) and `count` (number of lines) for slicing
+- `bash`: execute shell commands via `sh -c`
 
 ```toml
 [tools]
@@ -154,9 +154,9 @@ bash = "deny"
 ```
 
 permission levels:
-- `allow` — permitted without prompting
-- `ask` — prompts the user for confirmation via `/dev/tty`
-- `deny` — blocked silently
+- `allow`: permitted without prompting
+- `ask`: prompts the user for confirmation via `/dev/tty`
+- `deny`: blocked silently
 
 patterns support glob syntax: `**` matches any characters (including `/`), `?` matches a single character. for file-path tools (read), `*` matches within a single path segment (stops at `/`). for command tools (bash), `*` matches any characters including `/`. the most specific (fewest wildcards) matching pattern wins.
 
@@ -170,10 +170,10 @@ hooks are external executables that extend airun without recompiling. they live 
 
 each script is invoked as `<script> <stage>`, with a single JSON object on stdin and JSONL on stdout. supported stages:
 
-- `discover` — called once at startup to register the hook and its custom tools.
-- `mutate_request` — returned `system` strings are appended to the agent's system prompt.
-- `execute_tool` — called when the LLM invokes a hook-registered tool.
-- `tool_before` / `tool_after` — observational, fired around every tool call.
+- `discover`: called once at startup to register the hook and its custom tools.
+- `mutate_request`: returned `system` strings are appended to the agent's system prompt.
+- `execute_tool`: called when the LLM invokes a hook-registered tool.
+- `before_tool` / `after_tool`: observational, fired around every tool call.
 
 ```sh
 #!/bin/sh
@@ -195,7 +195,7 @@ esac
 
 the script must be executable. files starting with `.` or `__` are ignored. tool names are namespaced as `<prefix>_<short>` (here, `persona_trait`).
 
-airun implements the v1 protocol with partial conformance — session-bound stages (`idle`, `heartbeat`, `compacting`, `recover`, `format_notification`, `observe_message`, `actions`) and the `prompts/` contract are not implemented. see [DESIGN.md](DESIGN.md) for the rationale.
+airun implements the [harness control protocol](https://github.com/khimaros/hcp-spec/) with partial conformance (tier 0 and `before_stop` from tier 1). see [DESIGN.md](DESIGN.md) for the rationale.
 
 ## usage
 

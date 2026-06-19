@@ -33,11 +33,17 @@ fn write_hook(dir: &TempDir, name: &str, body: &str) {
 }
 
 #[cfg(unix)]
+fn enable_all_hooks(dir: &TempDir) {
+    fs::write(dir.path().join("airun.toml"), "[hooks]\n\"*\" = true\n").unwrap();
+}
+
+#[cfg(unix)]
 #[test]
 fn test_list_hooks_discovers_scripts() {
     let dir = TempDir::new().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
     write_hook(&dir, "demo.sh", "#!/bin/sh\nstage=\"$1\"\nif [ \"$stage\" = \"discover\" ]; then\n  echo '{\"name\":\"demo\",\"tools\":[{\"name\":\"ping\",\"description\":\"ping the demo\",\"parameters\":{\"msg\":\"the message\"}}]}'\nfi\n");
+    enable_all_hooks(&dir);
     airun(&dir)
         .arg("--list-hooks")
         .assert()
@@ -52,6 +58,7 @@ fn test_mutate_request_appends_to_system_prompt() {
     let dir = TempDir::new().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
     write_hook(&dir, "mutate.sh", "#!/bin/sh\nif [ \"$1\" = \"mutate_request\" ]; then\n  echo '{\"system\":[\"INJECTED-BY-HOOK\"]}'\nfi\n");
+    enable_all_hooks(&dir);
     airun(&dir)
         .arg("-s").arg("base prompt")
         .arg("-p").arg("hi")
@@ -64,12 +71,101 @@ fn test_mutate_request_appends_to_system_prompt() {
 
 #[cfg(unix)]
 #[test]
+fn test_mutate_request_payload_includes_system_user_and_model() {
+    // payload expansion: hook sees finalized system prompt, user prompt,
+    // and model id. dump the stdin payload
+    // straight to stderr via the `log` field so we can match on it.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    write_hook(&dir, "log.sh", r#"#!/bin/sh
+if [ "$1" = "mutate_request" ]; then
+  payload=$(cat)
+  printf 'PAYLOAD %s\n' "$payload" >&2
+fi
+"#);
+    enable_all_hooks(&dir);
+    airun(&dir)
+        .arg("-s").arg("THE-SYS")
+        .arg("-p").arg("THE-USR")
+        .arg("--model").arg("openai/THE-MODEL")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("\"system\":\"THE-SYS\""))
+        .stderr(predicate::str::contains("\"user\":\"THE-USR\""))
+        .stderr(predicate::str::contains("\"model\":\"openai/THE-MODEL\""));
+}
+
+#[cfg(unix)]
+fn write_datetime_hook(dir: &TempDir) {
+    write_hook(&dir, "datetime.sh", "#!/bin/sh\nstage=\"$1\"\ncase \"$stage\" in\n  discover) echo '{\"name\":\"datetime\",\"tools\":[{\"name\":\"now\",\"description\":\"current time\",\"parameters\":{}}]}' ;;\nesac\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_tools_glob_filters_hook_tool_from_dump_request() {
+    // [tools] "*" = true with "datetime_*" = false should hide the
+    // hook-registered `datetime_now` tool from --dump-request.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    write_datetime_hook(&dir);
+    fs::write(dir.path().join("airun.toml"), "[hooks]\n\"*\" = true\n[tools]\n\"*\" = true\n\"datetime_*\" = false\n").unwrap();
+    airun(&dir)
+        .arg("-s").arg("x")
+        .arg("-p").arg("y")
+        .arg("-D")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\": \"read\""))
+        .stdout(predicate::str::contains("\"name\": \"bash\""))
+        .stdout(predicate::str::contains("datetime_now").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_tools_glob_allows_hook_tool_when_pattern_enables_it() {
+    // sanity: with "*" = true and no override, the hook tool is exposed.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    write_datetime_hook(&dir);
+    fs::write(dir.path().join("airun.toml"), "[hooks]\n\"*\" = true\n[tools]\n\"*\" = true\n").unwrap();
+    airun(&dir)
+        .arg("-s").arg("x")
+        .arg("-p").arg("y")
+        .arg("-D")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("datetime_now"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hooks_gate_blocks_discovery() {
+    // [hooks] datetime = false hides the tool entirely (script's
+    // `discover` is run for --list-hooks, but the runtime manager
+    // filters it out, so --dump-request never sees datetime_now).
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    write_datetime_hook(&dir);
+    fs::write(dir.path().join("airun.toml"), "[hooks]\n\"*\" = true\ndatetime = false\n[tools]\n\"*\" = true\n").unwrap();
+    airun(&dir)
+        .arg("-s").arg("x")
+        .arg("-p").arg("y")
+        .arg("-D")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("datetime_now").not());
+}
+
+#[cfg(unix)]
+#[test]
 fn test_non_executable_hook_skipped() {
     let dir = TempDir::new().unwrap();
     fs::create_dir_all(dir.path().join(".git")).unwrap();
     let hooks_dir = dir.path().join(".agents").join("hooks");
     fs::create_dir_all(&hooks_dir).unwrap();
     fs::write(hooks_dir.join("not_exec.sh"), "#!/bin/sh\necho '{\"name\":\"nope\"}'\n").unwrap();
+    enable_all_hooks(&dir);
     airun(&dir)
         .arg("--list-hooks")
         .assert()
@@ -376,6 +472,40 @@ fn test_list_output_uses_aligned_columns() {
 }
 
 // --- empty input ---
+
+#[cfg(unix)]
+#[test]
+fn test_host_capability_payload_present() {
+    // every hook invocation includes a `host` block: {name, version, stages}.
+    // stages enumerates the canonical stage names this host fires
+    // (see https://github.com/khimaros/hcp-spec/).
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    write_hook(&dir, "hostlog.sh", r#"#!/bin/sh
+if [ "$1" = "mutate_request" ]; then
+  payload=$(cat)
+  printf 'PAYLOAD %s\n' "$payload" >&2
+fi
+"#);
+    enable_all_hooks(&dir);
+    airun(&dir)
+        .arg("-s").arg("x")
+        .arg("-p").arg("y")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("\"host\":{"))
+        .stderr(predicate::str::contains("\"name\":\"airun\""))
+        .stderr(predicate::str::contains("\"version\":2"))
+        // canonical stage names are advertised
+        .stderr(predicate::str::contains("\"before_tool\""))
+        .stderr(predicate::str::contains("\"after_tool\""))
+        .stderr(predicate::str::contains("\"before_stop\""))
+        // predecessor stage names must not leak back in
+        .stderr(predicate::str::contains("\"tool_before\"").not())
+        .stderr(predicate::str::contains("\"tool_after\"").not())
+        .stderr(predicate::str::contains("\"idle\"").not());
+}
 
 #[test]
 fn test_empty_prompt_shows_usage() {

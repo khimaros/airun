@@ -42,7 +42,7 @@ fn spool_dir() -> PathBuf {
 }
 
 /// writes `content` to a fresh file under the spool dir, returns its path
-/// (or None on failure — caller should degrade silently).
+/// (or None on failure; caller should degrade silently).
 fn write_spool_file(content: &str) -> Option<PathBuf> {
     let dir = spool_dir();
     fs::create_dir_all(&dir).ok()?;
@@ -182,7 +182,7 @@ fn glob_matches_recursive(pattern: &[u8], input: &[u8], path_mode: bool) -> bool
             }
             false
         }
-        // `*` — in path mode stops at `/`, otherwise matches anything
+        // `*`: in path mode stops at `/`, otherwise matches anything
         ([b'*', rest @ ..], _) => {
             let rest = skip_stars(rest);
             for i in 0..=input.len() {
@@ -195,7 +195,7 @@ fn glob_matches_recursive(pattern: &[u8], input: &[u8], path_mode: bool) -> bool
             }
             false
         }
-        // `?` — in path mode skips non-`/`, otherwise any char
+        // `?`: in path mode skips non-`/`, otherwise any char
         ([b'?', rest @ ..], [c, input_rest @ ..]) if !path_mode || *c != b'/' => {
             glob_matches_recursive(rest, input_rest, path_mode)
         }
@@ -213,6 +213,22 @@ fn skip_stars(pattern: &[u8]) -> &[u8] {
         p = rest;
     }
     p
+}
+
+/// looks up `key` in a map keyed by gitignore-style globs. returns the
+/// value of the most-specific matching pattern (longer literal prefix
+/// wins; `"*"` has specificity 0 so it acts as a default). returns
+/// `default` if nothing matches.
+fn glob_lookup<T: Clone>(map: &HashMap<String, T>, key: &str, default: T) -> T {
+    let mut best: Option<(usize, T)> = None;
+    for (pattern, value) in map {
+        if let Some(specificity) = glob_matches(pattern, key, false) {
+            if best.as_ref().is_none_or(|(s, _)| specificity >= *s) {
+                best = Some((specificity, value.clone()));
+            }
+        }
+    }
+    best.map(|(_, v)| v).unwrap_or(default)
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -260,16 +276,26 @@ impl PermissionsConfig {
     }
 
     fn check(&self, tool_name: &str, input: &str, path_mode: bool) -> PermissionLevel {
-        self.tools.get(tool_name)
-            .map(|p| p.check(input, path_mode))
+        // outer lookup: glob match on tool name (so `"*" = "deny"` works
+        // as a default). most-specific match wins; missing entries default
+        // to deny. inner pattern matching is delegated to `Permission::check`.
+        let mut best: Option<(usize, &Permission)> = None;
+        for (pattern, perm) in &self.tools {
+            if let Some(specificity) = glob_matches(pattern, tool_name, false) {
+                if best.as_ref().is_none_or(|(s, _)| specificity >= *s) {
+                    best = Some((specificity, perm));
+                }
+            }
+        }
+        best.map(|(_, p)| p.check(input, path_mode))
             .unwrap_or(PermissionLevel::Deny)
     }
 }
 
 /// a single CLI permission override, built from `--permissions-{allow,ask,deny}`.
 /// shapes for the flag value:
-///   `TOOL`                   → pattern is None (replaces tool entry)
-///   `TOOL:PATTERN`           → pattern merges into the tool's map
+///   `TOOL`                   -> pattern is None (replaces tool entry)
+///   `TOOL:PATTERN`           -> pattern merges into the tool's map
 #[derive(Debug, Clone)]
 struct PermissionOverride {
     tool: String,
@@ -277,7 +303,7 @@ struct PermissionOverride {
     level: PermissionLevel,
 }
 
-/// parses the `TOOL` or `TOOL:PATTERN` value (without the level — that's
+/// parses the `TOOL` or `TOOL:PATTERN` value (without the level, which is
 /// supplied by which flag was used).
 fn parse_permission_target(s: &str) -> Result<(String, Option<String>), String> {
     let (tool, pattern) = match s.split_once(':') {
@@ -304,12 +330,49 @@ impl ToolsConfig {
     }
 
     /// checks if a tool is active. if `tools_override` is Some, only
-    /// the listed tools are enabled (ignoring config). otherwise, uses config.
+    /// the listed tools are enabled (ignoring config). otherwise, looks up
+    /// the tool in the config map using gitignore-style glob matching
+    /// (most specific wins, `"*"` acts as a default). default: false.
     fn is_active(&self, tool_name: &str, tools_override: &Option<Vec<String>>) -> bool {
         match tools_override {
             Some(list) => list.iter().any(|t| t == tool_name),
-            None => *self.tools.get(tool_name).unwrap_or(&false),
+            None => glob_lookup(&self.tools, tool_name, false),
         }
+    }
+}
+
+/// gates which hook scripts are loaded, keyed by the hook's declared
+/// `name` (returned in `discover`, defaulting to the file stem). same
+/// glob semantics as `[tools]`: `"*" = false` is the default.
+#[derive(Deserialize, Debug, Default, Clone)]
+struct HooksConfig {
+    #[serde(flatten)]
+    hooks: HashMap<String, bool>,
+}
+
+impl HooksConfig {
+    /// checks if a hook is active. if `hooks_override` is Some, only the
+    /// listed hooks are enabled (ignoring config). otherwise, looks up
+    /// the hook in config with glob semantics.
+    fn is_active(&self, hook_name: &str, hooks_override: &Option<Vec<String>>) -> bool {
+        match hooks_override {
+            Some(list) => list.iter().any(|h| h == hook_name),
+            None => glob_lookup(&self.hooks, hook_name, false),
+        }
+    }
+}
+
+/// gates which skills are loadable. keyed by skill name (the file stem
+/// passed to `load_skill`). same glob semantics as `[tools]`.
+#[derive(Deserialize, Debug, Default, Clone)]
+struct SkillsConfig {
+    #[serde(flatten)]
+    skills: HashMap<String, bool>,
+}
+
+impl SkillsConfig {
+    fn is_active(&self, skill_name: &str) -> bool {
+        glob_lookup(&self.skills, skill_name, false)
     }
 }
 
@@ -445,17 +508,24 @@ impl Tool for ReadTool {
 
         let call_id = next_call_id();
         let args_json = serde_json::json!({"path": args.path});
-        self.hooks.tool_before("read", &call_id, &args_json);
+        let before = self.hooks.before_tool("read", &call_id, &args_json);
+        if let Some(reason) = before.deny {
+            return Err(ToolError::ToolCallError(format!("denied by hook: {}", reason).into()));
+        }
 
-        let content = fs::read_to_string(&resolved)
-            .map(|c| slice_lines(&c, args.offset, args.count))
-            .map_err(|e| {
-                ToolError::ToolCallError(format!("{}: {}", path_str, e).into())
-            })?;
-        let result = serde_json::to_string(&serde_json::json!({"content": content}))
-            .expect("serialize read result");
-        self.hooks.tool_after("read", &call_id, &result);
-        Ok(result)
+        let result = if let Some(synthetic) = before.result {
+            synthetic
+        } else {
+            let content = fs::read_to_string(&resolved)
+                .map(|c| slice_lines(&c, args.offset, args.count))
+                .map_err(|e| {
+                    ToolError::ToolCallError(format!("{}: {}", path_str, e).into())
+                })?;
+            serde_json::to_string(&serde_json::json!({"content": content}))
+                .expect("serialize read result")
+        };
+        let after = self.hooks.after_tool("read", &call_id, &result);
+        Ok(after.result.unwrap_or(result))
     }
 }
 
@@ -501,7 +571,7 @@ fn bash_tool_definition() -> ToolDefinition {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "the bash command to execute. must be simple — no pipes, redirects, chaining, or shell metacharacters"
+                    "description": "the bash command to execute. must be simple: no pipes, redirects, chaining, or shell metacharacters"
                 }
             },
             "required": ["command"]
@@ -509,7 +579,7 @@ fn bash_tool_definition() -> ToolDefinition {
     }
 }
 
-/// monotonic counter for `tool_before`/`tool_after` correlation ids.
+/// monotonic counter for `before_tool`/`after_tool` correlation ids.
 static CALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn next_call_id() -> String {
@@ -531,7 +601,7 @@ impl Tool for BashTool {
         if is_simple_bash_command(&args.command) {
             check_tool_permission(&self.permissions, "bash", &args.command, false)?;
         } else {
-            // command contains shell metacharacters — can't trust pattern
+            // command contains shell metacharacters, so we can't trust pattern
             // matching on the full string, so fall back to the catch-all rule.
             // use an empty string to only match wildcard patterns.
             let level = self.permissions.check("bash", "", false);
@@ -553,27 +623,34 @@ impl Tool for BashTool {
         }
         let call_id = next_call_id();
         let args_json = serde_json::json!({"command": args.command});
-        self.hooks.tool_before("bash", &call_id, &args_json);
-
-        let output = process::Command::new("sh")
-            .arg("-c")
-            .arg(&args.command)
-            .output()
-            .map_err(|e| {
-                ToolError::ToolCallError(format!("failed to execute: {}", e).into())
-            })?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut obj = serde_json::Map::new();
-        obj.insert("exit_code".into(), serde_json::json!(output.status.code().unwrap_or(-1)));
-        obj.insert("stdout".into(), serde_json::json!(stdout));
-        if !stderr.is_empty() {
-            obj.insert("stderr".into(), serde_json::json!(stderr));
+        let before = self.hooks.before_tool("bash", &call_id, &args_json);
+        if let Some(reason) = before.deny {
+            return Err(ToolError::ToolCallError(format!("denied by hook: {}", reason).into()));
         }
-        let result = serde_json::to_string(&serde_json::Value::Object(obj))
-            .expect("serialize bash result");
-        self.hooks.tool_after("bash", &call_id, &result);
-        Ok(result)
+
+        let result = if let Some(synthetic) = before.result {
+            synthetic
+        } else {
+            let output = process::Command::new("sh")
+                .arg("-c")
+                .arg(&args.command)
+                .output()
+                .map_err(|e| {
+                    ToolError::ToolCallError(format!("failed to execute: {}", e).into())
+                })?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut obj = serde_json::Map::new();
+            obj.insert("exit_code".into(), serde_json::json!(output.status.code().unwrap_or(-1)));
+            obj.insert("stdout".into(), serde_json::json!(stdout));
+            if !stderr.is_empty() {
+                obj.insert("stderr".into(), serde_json::json!(stderr));
+            }
+            serde_json::to_string(&serde_json::Value::Object(obj))
+                .expect("serialize bash result")
+        };
+        let after = self.hooks.after_tool("bash", &call_id, &result);
+        Ok(after.result.unwrap_or(result))
     }
 }
 
@@ -655,13 +732,17 @@ struct Args {
     #[arg(short = 't', long)]
     max_tokens: Option<u64>,
 
-    /// enable specific tools (comma-separated, e.g. --tools read,bash)
+    /// exclusive list of enabled tools (comma-separated, e.g. --tools read,bash)
     #[arg(long, value_delimiter = ',')]
     tools: Option<Vec<String>>,
 
-    /// attach additional skills (comma-separated)
+    /// exclusive list of skills to attach (comma-separated)
     #[arg(long, value_delimiter = ',')]
     skills: Option<Vec<String>>,
+
+    /// exclusive list of enabled hooks (comma-separated, by hook name)
+    #[arg(long, value_delimiter = ',')]
+    hooks: Option<Vec<String>>,
 
     /// print a human-readable summary of what would be sent and exit
     #[arg(short = 'n', long)]
@@ -708,6 +789,10 @@ struct Config {
     tools: ToolsConfig,
     #[serde(default, alias = "permission")]
     permissions: PermissionsConfig,
+    #[serde(default)]
+    hooks: HooksConfig,
+    #[serde(default)]
+    skills: SkillsConfig,
     #[serde(default)]
     providers: Vec<ProviderConfig>,
 }
@@ -845,13 +930,35 @@ fn find_file_in_dirs(kind: Kind, filename: &str) -> Option<PathBuf> {
 }
 
 /// prints rows as a padded table with 2-space column gaps.
-fn print_table(rows: &[Vec<&str>]) {
-    if rows.is_empty() { return; }
-    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+/// shortens a filesystem path for display: relative to cwd when the
+/// path is under it, else `~/...` when under $HOME, else the absolute
+/// path verbatim.
+fn shorten_path(path: &Path) -> String {
+    if let Ok(cwd) = env::current_dir() {
+        if let Ok(rel) = path.strip_prefix(&cwd) {
+            return rel.display().to_string();
+        }
+    }
+    if let Ok(home) = env::var("HOME") {
+        let home = PathBuf::from(home);
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn print_table(header: Option<&[&str]>, rows: &[Vec<&str>]) {
+    if rows.is_empty() && header.is_none() { return; }
+    let cols = header.map(|h| h.len()).into_iter()
+        .chain(rows.iter().map(|r| r.len()))
+        .max().unwrap_or(0);
     let widths: Vec<usize> = (0..cols).map(|c| {
-        rows.iter().map(|r| r.get(c).map_or(0, |s| s.len())).max().unwrap_or(0)
+        let header_w = header.and_then(|h| h.get(c)).map_or(0, |s| s.len());
+        let rows_w = rows.iter().map(|r| r.get(c).map_or(0, |s| s.len())).max().unwrap_or(0);
+        header_w.max(rows_w)
     }).collect();
-    for row in rows {
+    let print_row = |row: &[&str]| {
         let line: Vec<String> = row.iter().enumerate().map(|(i, val)| {
             if i + 1 < row.len() {
                 format!("{:<width$}", val, width = widths[i])
@@ -860,6 +967,15 @@ fn print_table(rows: &[Vec<&str>]) {
             }
         }).collect();
         println!("{}", line.join("  "));
+    };
+    if let Some(h) = header {
+        print_row(h);
+        let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+        let sep_refs: Vec<&str> = sep.iter().map(|s| s.as_str()).collect();
+        print_row(&sep_refs);
+    }
+    for row in rows {
+        print_row(row);
     }
 }
 
@@ -903,12 +1019,12 @@ fn print_permissions(perms: &PermissionsConfig) {
         }
     }
     let row_refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
-    print_table(&row_refs);
+    print_table(Some(&["tool", "pattern", "level"]), &row_refs);
 }
 
 /// finds all .md files in kind-specific subdirs across all base directories.
 /// returns (name, path) pairs with the `.md` extension stripped. flat
-/// fallback bases are not enumerated here — only structured subdirs.
+/// fallback bases are not enumerated here, only structured subdirs.
 fn find_all_in_dirs(kind: Kind) -> Vec<(String, PathBuf)> {
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1042,6 +1158,12 @@ macro_rules! stream_agent {
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
         let mut in_reasoning = false;
+        // track loop exit cause for the before_stop hook. a natural drain
+        // is reported as "stop"; a stream Err becomes "error" with the
+        // message. max_turns is not currently distinguishable from "stop"
+        // without rig exposing it.
+        let mut __exit_reason: &'static str = "stop";
+        let mut __exit_error: Option<String> = None;
         while let Some(chunk_result) = stream.next().await {
             macro_rules! end_reasoning {
                 () => {
@@ -1120,6 +1242,8 @@ macro_rules! stream_agent {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("stream error: {}", e);
+                    __exit_reason = "error";
+                    __exit_error = Some(format!("{}", e));
                     break;
                 }
             }
@@ -1128,6 +1252,7 @@ macro_rules! stream_agent {
             stderr.write_all(b"\n")?;
             stderr.flush()?;
         }
+        (__exit_reason, __exit_error)
     }};
 }
 
@@ -1156,7 +1281,13 @@ macro_rules! add_tools_and_stream {
     ($builder:expr, $tools:expr, $tools_override:expr, $permissions:expr, $hooks:expr, $user_prompt:expr) => {{
         let has_read = $tools.is_active("read", $tools_override);
         let has_bash = $tools.is_active("bash", $tools_override);
-        let dyn_hook_tools = $hooks.into_dyn_tools($permissions);
+        // hook-registered tools are gated by [tools] (matched on the
+        // tool's full_name, e.g. `datetime_now`) in addition to the
+        // [hooks] gate that decided which scripts to discover at all.
+        let dyn_hook_tools: Vec<Box<dyn rig::tool::ToolDyn>> = $hooks.into_dyn_tools($permissions)
+            .into_iter()
+            .filter(|t| $tools.is_active(&rig::tool::ToolDyn::name(t.as_ref()), $tools_override))
+            .collect();
         let builder = $builder.tools(dyn_hook_tools);
         let builder = if has_read {
             builder.tool(ReadTool { permissions: $permissions.clone(), hooks: $hooks.clone() })
@@ -1169,17 +1300,30 @@ macro_rules! add_tools_and_stream {
             builder
         };
         let agent = builder.build();
-        stream_agent!(agent, $user_prompt);
+        let (__exit_reason, __exit_error) = stream_agent!(agent, $user_prompt);
+        // tier 1: notify hooks that the loop has terminated. observational
+        // only; `continue` responses are accepted in the wire format but
+        // not honored (no re-entry), so `final` is always true.
+        $hooks.before_stop(__exit_reason, __exit_error.as_deref());
     }};
 }
 
-/// appends skill contents to a system prompt.
-fn append_skills(system_prompt: &mut String, skill_names: &[String]) {
-    if skill_names.is_empty() {
+/// appends skill contents to a system prompt. skills not enabled by
+/// `config` are skipped with a warning.
+fn append_skills(system_prompt: &mut String, skill_names: &[String], config: &SkillsConfig) {
+    let allowed: Vec<&String> = skill_names.iter().filter(|n| {
+        if config.is_active(n) {
+            true
+        } else {
+            eprintln!("warning: skill '{}' disabled by config", n);
+            false
+        }
+    }).collect();
+    if allowed.is_empty() {
         return;
     }
     system_prompt.push_str("\n\n# skills\n");
-    for skill_name in skill_names {
+    for skill_name in allowed {
         match load_skill(skill_name) {
             Ok(skill) => {
                 system_prompt.push_str(&format!("\n## {}\n", skill_name));
@@ -1195,10 +1339,10 @@ fn append_skills(system_prompt: &mut String, skill_names: &[String]) {
     }
 }
 
-fn build_system_prompt(agent: &ParsedDoc<AgentFrontmatter>) -> String {
+fn build_system_prompt(agent: &ParsedDoc<AgentFrontmatter>, skills_config: &SkillsConfig) -> String {
     let mut system_prompt = agent.body.clone();
     if let Some(skills) = &agent.frontmatter.skills {
-        append_skills(&mut system_prompt, skills);
+        append_skills(&mut system_prompt, skills, skills_config);
     }
     system_prompt
 }
@@ -1317,6 +1461,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(0);
     }
 
+    let config = load_config()?;
+
+    if let Some(limit) = config.tool_output_truncate {
+        TOOL_OUTPUT_TRUNCATE.store(limit, Ordering::Relaxed);
+    }
+
     if args.list_agents {
         let items: Vec<(String, String)> = find_all_in_dirs(Kind::Agent).into_iter().map(|(name, path)| {
             let desc = fs::read_to_string(&path).ok()
@@ -1326,59 +1476,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (name, desc)
         }).collect();
         let rows: Vec<Vec<&str>> = items.iter().map(|(n, d)| vec![n.as_str(), d.as_str()]).collect();
-        print_table(&rows);
+        print_table(Some(&["name", "description"]), &rows);
         process::exit(0);
     }
 
     if args.list_skills {
-        let items: Vec<(String, String)> = find_all_in_dirs(Kind::Skill).into_iter().map(|(name, path)| {
+        let items: Vec<(String, String, &'static str)> = find_all_in_dirs(Kind::Skill).into_iter().map(|(name, path)| {
             let desc = fs::read_to_string(&path).ok()
                 .and_then(|c| parse_markdown_with_frontmatter::<SkillFrontmatter>(&c).ok())
                 .and_then(|doc| doc.frontmatter.description)
                 .unwrap_or_default();
-            (name, desc)
+            let status = if config.skills.is_active(&name) { "true" } else { "false" };
+            (name, desc, status)
         }).collect();
-        let rows: Vec<Vec<&str>> = items.iter().map(|(n, d)| vec![n.as_str(), d.as_str()]).collect();
-        print_table(&rows);
+        let rows: Vec<Vec<&str>> = items.iter().map(|(n, d, s)| vec![n.as_str(), d.as_str(), *s]).collect();
+        print_table(Some(&["name", "description", "enabled"]), &rows);
         process::exit(0);
     }
 
-    let config = load_config()?;
-
-    if let Some(limit) = config.tool_output_truncate {
-        TOOL_OUTPUT_TRUNCATE.store(limit, Ordering::Relaxed);
-    }
-
-    let hooks = Arc::new(HookManager::discover());
+    // discover all hooks first; the `[hooks]` config gate is applied
+    // only to the runtime manager used during agent execution. list
+    // commands show everything that's available, regardless of config,
+    // matching how --list-tools and --list-skills behave.
+    let all_hooks = HookManager::discover();
 
     if args.list_tools {
+        let read_status = if config.tools.is_active("read", &args.tools) { "true" } else { "false" };
+        let bash_status = if config.tools.is_active("bash", &args.tools) { "true" } else { "false" };
         let mut rows: Vec<Vec<String>> = vec![
-            vec!["read".into(), "read the contents of a file".into()],
-            vec!["bash".into(), "execute a bash command".into()],
+            vec!["read".into(), "read the contents of a file".into(), read_status.into()],
+            vec!["bash".into(), "execute a bash command".into(), bash_status.into()],
         ];
-        for script in hooks.scripts() {
+        for script in all_hooks.scripts() {
+            let hook_active = config.hooks.is_active(&script.name, &args.hooks);
             for tool in &script.tools {
-                rows.push(vec![tool.full_name.clone(), tool.description.clone()]);
+                let active = hook_active && config.tools.is_active(&tool.full_name, &args.tools);
+                let status = if active { "true" } else { "false" };
+                rows.push(vec![tool.full_name.clone(), tool.description.clone(), status.into()]);
             }
         }
         let row_refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
-        print_table(&row_refs);
+        print_table(Some(&["name", "description", "enabled"]), &row_refs);
         process::exit(0);
     }
 
     if args.list_hooks {
         let mut rows: Vec<Vec<String>> = Vec::new();
-        for script in hooks.scripts() {
+        for script in all_hooks.scripts() {
+            let status = if config.hooks.is_active(&script.name, &args.hooks) { "true" } else { "false" };
             rows.push(vec![
                 script.name.clone(),
-                script.path.display().to_string(),
+                shorten_path(&script.path),
                 script.tools.iter().map(|t| t.full_name.clone()).collect::<Vec<_>>().join(","),
+                status.into(),
             ]);
         }
         let row_refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
-        print_table(&row_refs);
+        print_table(Some(&["name", "path", "tools", "enabled"]), &row_refs);
         process::exit(0);
     }
+
+    let hooks_config = config.hooks.clone();
+    let hooks_override = args.hooks.clone();
+    let hooks = Arc::new(all_hooks.retain(|name| hooks_config.is_active(name, &hooks_override)));
 
     if args.list_providers {
         let items: Vec<(String, String, String)> = config.providers.iter().map(|p| {
@@ -1387,7 +1547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (p.name.clone(), client, url)
         }).collect();
         let rows: Vec<Vec<&str>> = items.iter().map(|(n, c, u)| vec![n.as_str(), c.as_str(), u.as_str()]).collect();
-        print_table(&rows);
+        print_table(Some(&["name", "client", "base_url"]), &rows);
         process::exit(0);
     }
     
@@ -1400,16 +1560,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if let Some(skills) = &args.skills {
             // --skills overrides agent skills exclusively
             let mut prompt = agent.body.clone();
-            append_skills(&mut prompt, skills);
+            append_skills(&mut prompt, skills, &config.skills);
             (prompt, agent.frontmatter.model, agent.frontmatter.tools, agent.frontmatter.permissions)
         } else {
-            let prompt = build_system_prompt(&agent);
+            let prompt = build_system_prompt(&agent, &config.skills);
             (prompt, agent.frontmatter.model, agent.frontmatter.tools, agent.frontmatter.permissions)
         }
     } else {
         let mut prompt = args.system_prompt.clone().unwrap_or_default();
         if let Some(ref skill_list) = args.skills {
-            append_skills(&mut prompt, skill_list);
+            append_skills(&mut prompt, skill_list, &config.skills);
         }
         (prompt, None, ToolsConfig::default(), PermissionsConfig::default())
     };
@@ -1420,7 +1580,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // agent frontmatter overrides config; --permissions-* override both.
-    // applied in order: allow, ask, deny — so within a single invocation,
+    // applied in order: allow, ask, deny, so within a single invocation,
     // deny wins over ask wins over allow for the same target.
     let tools = config.tools.clone().merge(agent_tools);
     let mut perm_overrides: Vec<PermissionOverride> = Vec::new();
@@ -1442,20 +1602,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process::exit(0);
     }
 
-    // hook protocol: append `mutate_request` system prompt fragments
-    // (joined with blank lines) to whatever the agent already composed.
-    for fragment in hooks.mutate_request() {
-        if !system_prompt.is_empty() {
-            system_prompt.push_str("\n\n");
-        }
-        system_prompt.push_str(&fragment);
-    }
-
-    // markdown agent bodies and skills routinely leave trailing/leading
-    // blank lines from the frontmatter split; strip them so the prompt
-    // sent to the model is tidy.
-    let system_prompt = system_prompt.trim().to_string();
-
     let user_prompt = match get_user_prompt(&args) {
         Ok(p) => p,
         Err(e) => {
@@ -1471,6 +1617,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or(agent_model)
         .or(config.default_model.clone())
         .unwrap_or_else(|| "openai/gpt-4o".to_string());
+
+    // hook protocol: append `mutate_request` system prompt fragments
+    // (joined with blank lines) to whatever the agent already composed.
+    // hooks see the finalized system + user prompts and model id in the
+    // payload so observational hooks can log them.
+    for fragment in hooks.mutate_request(&system_prompt, &user_prompt, &full_model_name) {
+        if !system_prompt.is_empty() {
+            system_prompt.push_str("\n\n");
+        }
+        system_prompt.push_str(&fragment);
+    }
+
+    // markdown agent bodies and skills routinely leave trailing/leading
+    // blank lines from the frontmatter split; strip them so the prompt
+    // sent to the model is tidy.
+    let system_prompt = system_prompt.trim().to_string();
         
     let (provider_name, model_name) = full_model_name.split_once('/').unwrap_or(("openai", &full_model_name));
     
@@ -1587,6 +1749,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for script in hooks.scripts() {
             for t in &script.tools {
+                if !tools.is_active(&t.full_name, &args.tools) {
+                    continue;
+                }
                 tool_defs.push(serde_json::json!({
                     "type": "function",
                     "function": {
